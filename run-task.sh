@@ -16,10 +16,10 @@ DOCKER_CPU_LIMIT="${DOCKER_CPU_LIMIT:-2}"
 # Cleanup function
 cleanup() {
     if [ "${SERVICE:-}" = "postgres" ]; then
-        if docker ps --format '{{.Names}}' | grep -q "^${POSTGRES_CONTAINER}$"; then
+        if podman ps --format '{{.Names}}' | grep -q "^${POSTGRES_CONTAINER}$"; then
             echo "Cleaning up PostgreSQL container..."
-            docker stop "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
-            docker rm "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+            podman stop "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+            podman rm "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -46,11 +46,22 @@ Environment Variables:
     DOCKER_CPU_LIMIT     CPU limit for container (default: 2)
     DOCKER_IMAGE_VERSION Docker image tag to use (default: latest)
 
-All other arguments are passed directly to the pipeline.
+All other arguments are passed directly to the pipeline. Notable
+pass-through pipeline flags include:
+
+    --ptc                Enable Programmatic Tool Calling: overlay a
+                         \`programmatic_tool_call\` tool that runs Python
+                         in a persistent sandbox and routes tools[...]
+                         calls back through the underlying MCP server.
+                         Results land under <svc>-ptc/.
+    --ptc-timeout SECS   Per-call timeout for programmatic_tool_call
+                         (default: 60).
 
 Examples:
     $0 --mcp notion --models o3 --exp-name test-1 --tasks all
     $0 --mcp postgres --models gpt-4 --exp-name pg-test --tasks basic_queries
+    $0 --mcp filesystem --models qwen-3-coder-30b-a3b-instruct \\
+        --exp-name ptc-test --tasks all --ptc --ptc-timeout 240
 EOF
             exit 0
             ;;
@@ -64,9 +75,9 @@ DOCKER_IMAGE_VERSION="${DOCKER_IMAGE_VERSION:-latest}"
 DOCKER_IMAGE="${DOCKER_IMAGE_REPO}:${DOCKER_IMAGE_VERSION}"
 
 # Check if Docker image exists locally, pull only if not found
-if ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
+if ! podman image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
     echo "Docker image not found locally, pulling from Docker Hub..."
-    docker pull "$DOCKER_IMAGE" || {
+    podman pull "$DOCKER_IMAGE" || {
         echo "Error: Failed to pull Docker image from Docker Hub"
         echo "Please check your internet connection or Docker Hub access"
         exit 1
@@ -81,9 +92,9 @@ if [ ! -f .mcp_env ]; then
 fi
 
 # Create network if doesn't exist
-if ! docker network ls --format '{{.Name}}' | grep -q "^${NETWORK_NAME}$"; then
+if ! podman network ls --format '{{.Name}}' | grep -q "^${NETWORK_NAME}$"; then
     echo "Creating Docker network: $NETWORK_NAME"
-    docker network create "$NETWORK_NAME" || {
+    podman network create "$NETWORK_NAME" || {
         echo "Error: Failed to create Docker network"
         exit 1
     }
@@ -92,9 +103,9 @@ fi
 # Service-specific configurations
 if [ "$SERVICE" = "postgres" ]; then
     # For postgres service, ensure PostgreSQL container is running
-    if ! docker ps --format '{{.Names}}' | grep -q "^${POSTGRES_CONTAINER}$"; then
+    if ! podman ps --format '{{.Names}}' | grep -q "^${POSTGRES_CONTAINER}$"; then
         echo "Starting PostgreSQL container..."
-        docker run -d \
+        podman run -d \
             --name "$POSTGRES_CONTAINER" \
             --network "$NETWORK_NAME" \
             -e POSTGRES_DATABASE=postgres \
@@ -104,7 +115,7 @@ if [ "$SERVICE" = "postgres" ]; then
 
         echo "Waiting for PostgreSQL to be ready..."
         for i in {1..10}; do
-            if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then
+            if podman exec "$POSTGRES_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then
                 echo "PostgreSQL is ready!"
                 break
             fi
@@ -115,15 +126,24 @@ if [ "$SERVICE" = "postgres" ]; then
     fi
 
     # Run task with network connection to postgres
-    docker run --rm \
+    podman run --rm \
+        --http-proxy=false \
         --memory="$DOCKER_MEMORY_LIMIT" \
         --cpus="$DOCKER_CPU_LIMIT" \
         --network "$NETWORK_NAME" \
+        --add-host=host.docker.internal:host-gateway \
         -e POSTGRES_HOST="$POSTGRES_CONTAINER" \
         -e POSTGRES_PORT=5432 \
         -e POSTGRES_USERNAME=postgres \
         -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-password}" \
         -e POSTGRES_DATABASE=postgres \
+        -e QWEN3_CODER_30B_BASE_URL=http://host.docker.internal:28025/v1 \
+        -e QWEN3_CODER_30B_BASE_URL_150=http://host.docker.internal:28026/v1 \
+        -e QWEN3_8B_BASE_URL=http://host.docker.internal:28025/v1 \
+        -e QWEN3_8B_SFT_BASE_URL=http://host.docker.internal:28025/v1 \
+        -e QWEN3_5_9B_BASE_URL=http://host.docker.internal:28026/v1 \
+        -e NO_PROXY=host.docker.internal \
+        -e no_proxy=host.docker.internal \
         -v "$(pwd)/results:/app/results" \
         -v "$(pwd)/postgres_state:/app/postgres_state" \
         $([ -f .mcp_env ] && echo "-v $(pwd)/.mcp_env:/app/.mcp_env:ro") \
@@ -131,9 +151,11 @@ if [ "$SERVICE" = "postgres" ]; then
         python3 -m pipeline --mcp "$SERVICE" --k 1 "$@"
 elif [ "$SERVICE" = "filesystem" ]; then
     # For filesystem service, mount test_environments
-    docker run --rm \
+    podman run --rm \
+        --http-proxy=false \
         --memory="$DOCKER_MEMORY_LIMIT" \
         --cpus="$DOCKER_CPU_LIMIT" \
+        --network=host \
         -v "$(pwd)/results:/app/results" \
         -v "$(pwd)/test_environments:/app/test_environments" \
         $([ -f .mcp_env ] && echo "-v $(pwd)/.mcp_env:/app/.mcp_env:ro") \
@@ -141,7 +163,8 @@ elif [ "$SERVICE" = "filesystem" ]; then
         python3 -m pipeline --mcp "$SERVICE" --k 1 "$@"
 elif [ "$SERVICE" = "insforge" ]; then
     # For Insforge service, use host network to access Insforge backend on host
-    docker run --rm \
+    podman run --rm \
+        --http-proxy=false \
         --memory="$DOCKER_MEMORY_LIMIT" \
         --cpus="$DOCKER_CPU_LIMIT" \
         --add-host=host.docker.internal:host-gateway \
@@ -151,9 +174,11 @@ elif [ "$SERVICE" = "insforge" ]; then
         python3 -m pipeline --mcp "$SERVICE" --k 1 "$@"
 else
     # For other services (notion, github, playwright, etc.)
-    docker run --rm \
+    podman run --rm \
+        --http-proxy=false \
         --memory="$DOCKER_MEMORY_LIMIT" \
         --cpus="$DOCKER_CPU_LIMIT" \
+        --network=host \
         -v "$(pwd)/results:/app/results" \
         -v "$(pwd)/test_environments:/app/test_environments" \
         $([ -f .mcp_env ] && echo "-v $(pwd)/.mcp_env:/app/.mcp_env:ro") \

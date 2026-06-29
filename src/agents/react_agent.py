@@ -49,6 +49,8 @@ class ReActAgent(BaseMCPAgent):
         max_iterations: int = 100,
         system_prompt: Optional[str] = None,
         compaction_token: int = BaseMCPAgent.COMPACTION_DISABLED_TOKEN,
+        ptc: bool = False,
+        ptc_timeout: int = 60,
     ):
         super().__init__(
             litellm_input_model_name=litellm_input_model_name,
@@ -60,6 +62,8 @@ class ReActAgent(BaseMCPAgent):
             service_config_provider=service_config_provider,
             reasoning_effort=reasoning_effort,
             compaction_token=compaction_token,
+            ptc=ptc,
+            ptc_timeout=ptc_timeout,
         )
         self.max_iterations = max_iterations
         self.react_system_prompt = system_prompt or self.DEFAULT_SYSTEM_PROMPT

@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Callable
 
 from src.logger import get_logger
-from .mcp import MCPStdioServer, MCPHttpServer
+from .mcp import MCPStdioServer, MCPHttpServer, PTCWrapper
 from .utils import TokenUsageTracker
 
 logger = get_logger(__name__)
@@ -49,6 +49,8 @@ class BaseMCPAgent(ABC):
         service_config_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         reasoning_effort: Optional[str] = "default",
         compaction_token: int = COMPACTION_DISABLED_TOKEN,
+        ptc: bool = False,
+        ptc_timeout: int = 60,
     ):
         self.litellm_input_model_name = litellm_input_model_name
         self.api_key = api_key
@@ -59,6 +61,8 @@ class BaseMCPAgent(ABC):
         self._service_config_provider = service_config_provider
         self.reasoning_effort = reasoning_effort or "default"
         self.compaction_token = int(compaction_token)
+        self.ptc = bool(ptc)
+        self.ptc_timeout = int(ptc_timeout)
 
         self.is_claude = self._is_anthropic_model(litellm_input_model_name)
         self.use_claude_thinking = self.is_claude and self.reasoning_effort != "default"
@@ -164,10 +168,23 @@ class BaseMCPAgent(ABC):
 
     async def _create_mcp_server(self) -> Any:
         if self.mcp_service in self.STDIO_SERVICES:
-            return self._create_stdio_server()
-        if self.mcp_service in self.HTTP_SERVICES:
-            return self._create_http_server()
-        raise ValueError(f"Unsupported MCP service: {self.mcp_service}")
+            server = self._create_stdio_server()
+        elif self.mcp_service in self.HTTP_SERVICES:
+            server = self._create_http_server()
+        else:
+            raise ValueError(f"Unsupported MCP service: {self.mcp_service}")
+        return self._maybe_wrap_ptc(server)
+
+    def _maybe_wrap_ptc(self, server: Any) -> Any:
+        if not self.ptc:
+            return server
+        workspace = (
+            self.service_config.get("test_directory")
+            or self.service_config.get("workspace")
+        )
+        return PTCWrapper(
+            server, workspace=workspace, default_code_timeout=self.ptc_timeout
+        )
 
     def _create_stdio_server(self) -> MCPStdioServer:
         if self.mcp_service == "notion":

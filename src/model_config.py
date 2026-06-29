@@ -91,6 +91,11 @@ class ModelConfig:
             "api_key_var": "DEEPSEEK_API_KEY",
             "litellm_input_model_name": "deepseek/deepseek-chat",
         },
+        "deepseek-chat": {
+            "provider": "deepseek",
+            "api_key_var": "DEEPSEEK_API_KEY",
+            "litellm_input_model_name": "deepseek/deepseek-chat",
+        },
         "deepseek-v3.2-thinking": {
             "provider": "deepseek",
             "api_key_var": "DEEPSEEK_API_KEY",
@@ -171,6 +176,36 @@ class ModelConfig:
             "litellm_input_model_name": "xai/grok-code-fast-1",
         },
         # Qwen models
+        "qwen-3-8b": {
+            "provider": "vllm",
+            "api_key_var": "QWEN3_8B_API_KEY",
+            "base_url_var": "QWEN3_8B_BASE_URL",
+            "litellm_input_model_name": "hosted_vllm/Qwen3-8B",
+        },
+        "qwen-3-8b-sft": {
+            "provider": "vllm",
+            "api_key_var": "QWEN3_8B_SFT_API_KEY",
+            "base_url_var": "QWEN3_8B_SFT_BASE_URL",
+            "litellm_input_model_name": "hosted_vllm/Qwen3-8B",
+        },
+        "qwen-3.5-9b": {
+            "provider": "vllm",
+            "api_key_var": "QWEN3_5_9B_API_KEY",
+            "base_url_var": "QWEN3_5_9B_BASE_URL",
+            "litellm_input_model_name": "hosted_vllm/Qwen3.5-9B",
+        },
+        "qwen-3-coder-30b-a3b-instruct": {
+            "provider": "vllm",
+            "api_key_var": "QWEN3_CODER_30B_API_KEY",
+            "base_url_var": "QWEN3_CODER_30B_BASE_URL",
+            "litellm_input_model_name": "hosted_vllm/Qwen3-Coder-30B-A3B-Instruct",
+        },
+        "qwen-3-coder-30b-a3b-instruct-150": {
+            "provider": "vllm",
+            "api_key_var": "QWEN3_CODER_30B_API_KEY_150",
+            "base_url_var": "QWEN3_CODER_30B_BASE_URL_150",
+            "litellm_input_model_name": "hosted_vllm/Qwen3-Coder-30B-A3B-Instruct",
+        },
         "qwen-3-coder-plus": {
             "provider": "qwen",
             "api_key_var": "DASHSCOPE_API_KEY",

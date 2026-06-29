@@ -9,10 +9,12 @@ set -e
 MODELS=""
 EXP_NAME=""
 USE_DOCKER=false
-SERVICES="filesystem,notion,github,postgres,playwright"
+SERVICES="filesystem,playwright,playwright_webarena,notion,postgres"
 PARALLEL=false
 TIMEOUT=3600
 K=4
+PTC=false
+PTC_TIMEOUT=""
 
 # Color codes for output
 RED='\033[0;31m'
@@ -69,6 +71,14 @@ while [[ $# -gt 0 ]]; do
             K="$2"
             shift 2
             ;;
+        --ptc)
+            PTC=true
+            shift
+            ;;
+        --ptc-timeout)
+            PTC_TIMEOUT="$2"
+            shift 2
+            ;;
         --help)
             cat << EOF
 Usage: $0 --models MODELS --exp-name NAME [OPTIONS]
@@ -87,6 +97,9 @@ Optional Options:
     --parallel          Run services in parallel (experimental)
     --timeout SECONDS   Timeout per task in seconds (default: 300)
     --k RUNS            Repeat runs per service for pass@k (default: 4)
+    --ptc               Enable Programmatic Tool Calling (overlay a
+                        programmatic_tool_call sandbox tool). Results land under <svc>-ptc/.
+    --ptc-timeout SECS  Default per-call timeout for programmatic_tool_call (default: 60)
 
 Examples:
     # Run all services with Docker
@@ -122,7 +135,7 @@ fi
 
 # Check prerequisites
 if [ "$USE_DOCKER" = true ]; then
-    if ! command -v docker &> /dev/null; then
+    if ! command -v podman &> /dev/null; then
         print_error "Docker is not installed"
         exit 1
     fi
@@ -131,9 +144,9 @@ if [ "$USE_DOCKER" = true ]; then
     DOCKER_IMAGE="evalsysorg/mcpmark:latest"
 
     # Check if Docker image exists locally, pull only if not found
-    if ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
+    if ! podman image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
         print_status "Docker image not found locally, pulling from Docker Hub..."
-        docker pull "$DOCKER_IMAGE" || {
+        podman pull "$DOCKER_IMAGE" || {
             print_error "Failed to pull Docker image from Docker Hub"
             exit 1
         }
@@ -178,6 +191,7 @@ echo "Docker:      $USE_DOCKER"
 echo "Parallel:    $PARALLEL"
 echo "Timeout:     ${TIMEOUT}s per task"
 echo "K-Runs:      $K"
+echo "PTC:         $PTC$( [ -n "$PTC_TIMEOUT" ] && echo " (timeout=${PTC_TIMEOUT}s)" )"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
@@ -201,6 +215,15 @@ run_service() {
 
     print_status "[$start_time_formatted] Starting $service tasks..."
 
+    # Build PTC pass-through args
+    local ptc_args=()
+    if [ "$PTC" = true ]; then
+        ptc_args+=(--ptc)
+        if [ -n "$PTC_TIMEOUT" ]; then
+            ptc_args+=(--ptc-timeout "$PTC_TIMEOUT")
+        fi
+    fi
+
     if [ "$USE_DOCKER" = true ]; then
         # Run with Docker
         ./run-task.sh --mcp "$service" \
@@ -208,7 +231,7 @@ run_service() {
             --exp-name "$EXP_NAME" \
             --tasks all \
             --timeout "$TIMEOUT" \
-            --k "$K" 2>&1 | tee -a "$LOG_FILE"
+            --k "$K" "${ptc_args[@]}" 2>&1 | tee -a "$LOG_FILE"
     else
         # Run locally
         python3 -m pipeline \
@@ -217,10 +240,11 @@ run_service() {
             --exp-name "$EXP_NAME" \
             --tasks all \
             --timeout "$TIMEOUT" \
-            --k "$K" 2>&1 | tee -a "$LOG_FILE"
+            --k "$K" "${ptc_args[@]}" 2>&1 | tee -a "$LOG_FILE"
     fi
 
-    local exit_code=$?
+    # PIPESTATUS[0] is the real pipeline exit code; $? would be tee's.
+    local exit_code=${PIPESTATUS[0]}
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
 
@@ -257,9 +281,9 @@ if [ "$PARALLEL" = true ]; then
     # Wait for all background jobs and collect exit codes
     for pid in "${pids[@]}"; do
         if wait $pid; then
-            ((COMPLETED_SERVICES++))
+            COMPLETED_SERVICES=$((COMPLETED_SERVICES + 1))
         else
-            ((FAILED_SERVICES++))
+            FAILED_SERVICES=$((FAILED_SERVICES + 1))
         fi
     done
 else
@@ -267,9 +291,9 @@ else
 
     for service in "${SERVICE_ARRAY[@]}"; do
         if run_service "$service"; then
-            ((COMPLETED_SERVICES++))
+            COMPLETED_SERVICES=$((COMPLETED_SERVICES + 1))
         else
-            ((FAILED_SERVICES++))
+            FAILED_SERVICES=$((FAILED_SERVICES + 1))
             print_warning "Continuing despite failure in $service"
         fi
     done

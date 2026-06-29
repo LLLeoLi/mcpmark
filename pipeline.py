@@ -111,6 +111,21 @@ def main():
         ),
     )
     parser.add_argument(
+        "--ptc",
+        action="store_true",
+        help=(
+            "Enable Programmatic Tool Calling: overlay a `programmatic_tool_call` tool "
+            "that runs Python in a persistent sandbox and routes tools[...] "
+            "calls back through the underlying MCP server."
+        ),
+    )
+    parser.add_argument(
+        "--ptc-timeout",
+        type=int,
+        default=60,
+        help="Default timeout (seconds) for a single programmatic_tool_call call (default: 60)",
+    )
+    parser.add_argument(
         "--reasoning-effort",
         default="default",
         choices=["default", "minimal", "low", "medium", "high", "xhigh", "max"],
@@ -194,6 +209,8 @@ def main():
                 agent_name=args.agent,
                 task_suite=args.task_suite,
                 compaction_token=args.compaction_token,
+                ptc=args.ptc,
+                ptc_timeout=args.ptc_timeout,
             )
 
             pipeline.run_evaluation(args.tasks)

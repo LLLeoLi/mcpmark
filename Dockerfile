@@ -74,9 +74,15 @@ RUN pip install --no-cache-dir pipx && \
 # Layer 7: Copy Python packages from builder (changes with dependencies)
 COPY --from=builder /root/.local /root/.local
 
-# Layer 8: Playwright browsers (changes with browser versions)
+# Layer 8: Pre-install pinned MCP server + matching Chromium (offline-ready).
+# Keep @playwright/mcp version aligned with src/agents/{base_agent,mcpmark_agent}.py;
+# the playwright alpha pin must match @playwright/mcp's package.json — different
+# mcp versions ship with different chromium revisions, and a mismatch surfaces at
+# runtime as 'Browser "chromium" is not installed'.
 RUN python3 -m playwright install chromium && \
-    npx -y playwright install chromium
+    npm install -g @playwright/mcp@0.0.68 && \
+    npx --yes --package=playwright@1.59.0-alpha-1771104257000 -- \
+        playwright install chromium
 
 # Layer 9: Install PostgreSQL MCP server (Python, used via `pipx run postgres-mcp`)
 RUN pipx install postgres-mcp==0.3.0

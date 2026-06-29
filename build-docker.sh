@@ -11,7 +11,7 @@ NC='\033[0m' # No Color
 echo -e "${YELLOW}Building MCPMark Docker image locally...${NC}"
 
 # Build the Docker image with the same tag as Docker Hub for local testing
-docker build -t evalsysorg/mcpmark:latest . "$@"
+podman build --http-proxy=false -t evalsysorg/mcpmark:latest . "$@"
 
 # Check if build was successful
 if [ $? -eq 0 ]; then
@@ -21,7 +21,7 @@ if [ $? -eq 0 ]; then
     # Show image info
     echo ""
     echo "Image details:"
-    docker images evalsysorg/mcpmark:latest --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}"
+    podman images evalsysorg/mcpmark:latest --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}"
 
     echo ""
     echo "You can now run tasks using:"

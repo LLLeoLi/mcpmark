@@ -18,14 +18,55 @@ import nest_asyncio
 from src.logger import get_logger
 from .base_agent import BaseMCPAgent
 from .mcp import MCPStdioServer, MCPHttpServer
+from .mcp.ptc_wrapper import PTCWrapper
 
 # Apply nested asyncio support
 nest_asyncio.apply()
+
+# Name of the explicit task-completion tool overlaid by PTCWrapper. Under PTC,
+# a run ends only when the model calls this tool; bare/empty responses trigger
+# a retry instead of being treated as "done".
+CLAIM_DONE_TOOL = PTCWrapper.CLAIM_DONE_TOOL
+_CLAIM_DONE_NUDGE = (
+    "You did not call any tool. If the task is fully complete and all required "
+    f"outputs have been written, call the `{CLAIM_DONE_TOOL}` tool to finish. "
+    "Otherwise, keep working using the available tools."
+)
+# Max consecutive empty (no content, no tool call) responses under PTC before
+# we give up and fail the run instead of looping to the turn limit.
+_MAX_EMPTY_PTC_RESPONSES = 3
+# Appended to the system prompt ONLY under PTC, so the model knows that a plain
+# text answer does not end the run — it must call the claim_done tool.
+_PTC_SYSTEM_SUFFIX = (
+    "\n\nIMPORTANT: This run does not end when you stop calling tools. When, and "
+    f"only when, the task is fully complete, call the `{CLAIM_DONE_TOOL}` tool to "
+    "finish. Do not end with a plain text answer — if you produce text without "
+    f"calling `{CLAIM_DONE_TOOL}`, you will be asked to keep working."
+)
 
 # Configure LiteLLM
 litellm.suppress_debug_info = True
 
 logger = get_logger(__name__)
+
+
+def _summarize_empty_response(payload: dict, max_chars: int = 2000) -> str:
+    """Render a compact, truncated diagnostic for an "empty" PTC response.
+
+    Under PTC a response is treated as "empty" when it carries no tool call and
+    no usable text, which can happen for several distinct reasons: whitespace-/
+    reasoning-only output, length truncation (``finish_reason='length'``), a
+    provider refusal, or a tool call that failed to parse and was dropped. We
+    log the raw payload so the execution log shows *which* of these occurred
+    instead of only the opaque "empty response" counter.
+    """
+    try:
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        text = repr(payload)
+    # if len(text) > max_chars:
+        # text = f"{text[:max_chars]}... [truncated, {len(text)} chars total]"
+    return text
 
 
 # To fix the "Object of type AnyUrl is not JSON serializable" error in the find_file_contents function.
@@ -44,7 +85,7 @@ class MCPMarkAgent(BaseMCPAgent):
     - Other models: Manual MCP server management with function calling
     """
 
-    MAX_TURNS = 100
+    MAX_TURNS = 200
     SYSTEM_PROMPT = (
         "You are a helpful agent that uses tools iteratively to complete the user's task, "
         'and when finished, provides the final answer or simply states "Task completed" without further tool calls.'
@@ -72,6 +113,8 @@ class MCPMarkAgent(BaseMCPAgent):
         service_config_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         reasoning_effort: Optional[str] = "default",
         compaction_token: int = BaseMCPAgent.COMPACTION_DISABLED_TOKEN,
+        ptc: bool = False,
+        ptc_timeout: int = 60,
     ):
         super().__init__(
             litellm_input_model_name=litellm_input_model_name,
@@ -83,6 +126,8 @@ class MCPMarkAgent(BaseMCPAgent):
             service_config_provider=service_config_provider,
             reasoning_effort=reasoning_effort,
             compaction_token=compaction_token,
+            ptc=ptc,
+            ptc_timeout=ptc_timeout,
         )
         logger.debug(
             "Initialized MCPMarkAgent for '%s' with model '%s' (Claude: %s, Thinking: %s, Reasoning: %s)",
@@ -524,8 +569,9 @@ class MCPMarkAgent(BaseMCPAgent):
         max_turns = self.MAX_TURNS
         hit_turn_limit = False
         ended_normally = False
+        consecutive_empty = 0  # PTC: consecutive empty responses with no tool call
 
-        system_text = self.SYSTEM_PROMPT
+        system_text = self.SYSTEM_PROMPT + (_PTC_SYSTEM_SUFFIX if self.ptc else "")
         # Record initial state
         self._update_progress(messages, total_tokens, turn_count)
 
@@ -623,15 +669,69 @@ class MCPMarkAgent(BaseMCPAgent):
                     }
                 )
 
-            messages.append({"role": "assistant", "content": assistant_content})
+            # Under PTC we require an explicit claim_done; don't keep an empty
+            # assistant turn that would otherwise be re-sent to the API.
+            if self.ptc and not tool_uses and not assistant_content:
+                pass
+            else:
+                messages.append({"role": "assistant", "content": assistant_content})
 
             # Update partial progress after assistant response
             self._update_progress(messages, total_tokens, turn_count)
 
             # If no tool calls, we're done
             if not tool_uses:
+                if self.ptc:
+                    # PTC: never finish on a bare response; only claim_done ends
+                    # the run. Nudge on text, retry on empty.
+                    has_text = any(tb.get("text", "").strip() for tb in text_blocks)
+                    if has_text:
+                        # assistant(text) was appended above; nudge to continue
+                        # or explicitly claim done (keeps role alternation valid).
+                        consecutive_empty = 0
+                        messages.append(
+                            {"role": "user", "content": _CLAIM_DONE_NUDGE}
+                        )
+                        logger.info(
+                            "| Model produced text without a tool call (PTC) — "
+                            "nudging to continue or call 'claim_done'."
+                        )
+                    else:
+                        # Empty assistant turn was not appended (to preserve
+                        # alternation); simply retry the API call. Dump the raw
+                        # payload first so the log shows *why* it was empty.
+                        debug = _summarize_empty_response(
+                            {
+                                "stop_reason": response.get("stop_reason"),
+                                "blocks": blocks,
+                                "usage": response.get("usage"),
+                            }
+                        )
+                        consecutive_empty += 1
+                        logger.warning(f"|   ↳ empty-response payload: {debug}")
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                                f.write(
+                                    f"| [empty-response "
+                                    f"{consecutive_empty}/{_MAX_EMPTY_PTC_RESPONSES}] "
+                                    f"{debug}\n"
+                                )
+                        if consecutive_empty >= _MAX_EMPTY_PTC_RESPONSES:
+                            error_msg = (
+                                f"Too many consecutive empty responses "
+                                f"({consecutive_empty}) under PTC"
+                            )
+                            logger.warning(f"| ✗ {error_msg}")
+                            break
+                        logger.warning(
+                            f"| ✗ Empty response with no tool call (PTC) — "
+                            f"retrying ({consecutive_empty}/{_MAX_EMPTY_PTC_RESPONSES})"
+                        )
+                    self._update_progress(messages, total_tokens, turn_count)
+                    continue
                 ended_normally = True
                 break
+            consecutive_empty = 0
 
             # Execute tools and add results
             tool_results = []
@@ -680,6 +780,16 @@ class MCPMarkAgent(BaseMCPAgent):
             messages.append({"role": "user", "content": tool_results})
             # Update partial progress after tool results
             self._update_progress(messages, total_tokens, turn_count)
+
+            # Under PTC, an explicit claim_done call is the only way to finish.
+            if self.ptc and any(
+                tu.get("name") == CLAIM_DONE_TOOL for tu in tool_uses
+            ):
+                logger.info(
+                    "|\n|\n| Task ended: model called the 'claim_done' tool."
+                )
+                ended_normally = True
+                break
 
         # Detect if we exited due to hitting the turn limit
         if not ended_normally:
@@ -786,8 +896,9 @@ class MCPMarkAgent(BaseMCPAgent):
         tool_call_log_file: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute function calling loop with LiteLLM."""
+        system_content = self.SYSTEM_PROMPT + (_PTC_SYSTEM_SUFFIX if self.ptc else "")
         messages = [
-            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": instruction},
         ]
         total_tokens = {
@@ -800,6 +911,7 @@ class MCPMarkAgent(BaseMCPAgent):
         max_turns = self.MAX_TURNS  # Limit turns to prevent infinite loops
         consecutive_failures = 0
         max_consecutive_failures = 3
+        consecutive_empty = 0  # PTC: consecutive empty responses with no tool call
         hit_turn_limit = False
         ended_normally = False
 
@@ -967,6 +1079,7 @@ class MCPMarkAgent(BaseMCPAgent):
 
                 # Check for tool calls (newer format)
                 if hasattr(message, "tool_calls") and message.tool_calls:
+                    consecutive_empty = 0
                     messages.append(message_dict)
                     turn_count += 1
                     # Update progress after assistant with tool calls
@@ -974,7 +1087,38 @@ class MCPMarkAgent(BaseMCPAgent):
                     # Process tool calls
                     for tool_call in message.tool_calls:
                         func_name = tool_call.function.name
-                        func_args = json.loads(tool_call.function.arguments)
+                        raw_args = tool_call.function.arguments
+                        try:
+                            func_args = json.loads(raw_args or "{}")
+                        except json.JSONDecodeError as e:
+                            # The model (or the server-side tool-call parser) emitted
+                            # arguments that are not valid JSON. Don't crash the whole
+                            # run — feed the error back as this tool call's result so
+                            # the model can correct itself and retry (mirrors the
+                            # training-time eval's behaviour). A tool message with the
+                            # matching tool_call_id is still required to keep the
+                            # assistant/tool turns valid for the API.
+                            error_msg = (
+                                f"Failed to parse tool arguments for '{func_name}': {e}. "
+                                f"Arguments must be a valid JSON object matching the tool "
+                                f"schema. Received: {raw_args!r}"
+                            )
+                            logger.warning(f"| ✗ {error_msg}")
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": f"Error: {error_msg}",
+                                }
+                            )
+                            if tool_call_log_file:
+                                with open(
+                                    tool_call_log_file, "a", encoding="utf-8"
+                                ) as f:
+                                    f.write(
+                                        f"| [bad-arguments] {func_name} {raw_args!r}\n"
+                                    )
+                            continue
 
                         try:
                             result = await asyncio.wait_for(
@@ -1026,6 +1170,74 @@ class MCPMarkAgent(BaseMCPAgent):
                             with open(tool_call_log_file, "a", encoding="utf-8") as f:
                                 f.write(f"| {func_name} {args_str}\n")
                     # Update progress after tool results appended
+                    self._update_progress(messages, total_tokens, turn_count)
+
+                    # Under PTC, an explicit claim_done call is the only way to
+                    # finish. Detect it among the processed tool calls and end.
+                    if self.ptc and any(
+                        tc.function.name == CLAIM_DONE_TOOL
+                        for tc in message.tool_calls
+                    ):
+                        logger.info(
+                            "|\n|\n| Task ended: model called the 'claim_done' tool."
+                        )
+                        ended_normally = True
+                        break
+                    continue
+                elif self.ptc:
+                    # PTC: never treat a bare/empty response as task completion.
+                    # The run ends only via the claim_done tool (handled above).
+                    content_text = getattr(message, "content", None)
+                    if content_text and content_text.strip():
+                        # Non-empty text but no tool call: keep it and nudge the
+                        # model to either continue or explicitly claim done.
+                        consecutive_empty = 0
+                        messages.append(message_dict)
+                        messages.append(
+                            {"role": "user", "content": _CLAIM_DONE_NUDGE}
+                        )
+                        logger.info(
+                            "| Model produced text without a tool call (PTC) — "
+                            "nudging to continue or call 'claim_done'."
+                        )
+                    else:
+                        # Empty/truncated response: retry by re-prompting. Dump
+                        # the raw payload first so the log shows *why* it was
+                        # empty (whitespace-/reasoning-only, length truncation,
+                        # refusal, dropped tool call, ...).
+                        finish_reason = None
+                        try:
+                            finish_reason = choices[0].finish_reason
+                        except Exception:  # noqa: BLE001
+                            pass
+                        debug = _summarize_empty_response(
+                            {
+                                "finish_reason": finish_reason,
+                                "message": message_dict,
+                            }
+                        )
+                        consecutive_empty += 1
+                        logger.warning(f"|   ↳ empty-response payload: {debug}")
+                        if tool_call_log_file:
+                            with open(tool_call_log_file, "a", encoding="utf-8") as f:
+                                f.write(
+                                    f"| [empty-response "
+                                    f"{consecutive_empty}/{_MAX_EMPTY_PTC_RESPONSES}] "
+                                    f"{debug}\n"
+                                )
+                        if consecutive_empty >= _MAX_EMPTY_PTC_RESPONSES:
+                            raise Exception(
+                                f"Too many consecutive empty responses "
+                                f"({consecutive_empty}) under PTC"
+                            )
+                        logger.warning(
+                            f"| ✗ Empty response with no tool call (PTC) — "
+                            f"retrying ({consecutive_empty}/{_MAX_EMPTY_PTC_RESPONSES})"
+                        )
+                        messages.append(
+                            {"role": "user", "content": _CLAIM_DONE_NUDGE}
+                        )
+                    turn_count += 1
                     self._update_progress(messages, total_tokens, turn_count)
                     continue
                 else:
@@ -1102,11 +1314,12 @@ class MCPMarkAgent(BaseMCPAgent):
     async def _create_mcp_server(self) -> Any:
         """Create and return an MCP server instance."""
         if self.mcp_service in self.STDIO_SERVICES:
-            return self._create_stdio_server()
+            server = self._create_stdio_server()
         elif self.mcp_service in self.HTTP_SERVICES:
-            return self._create_http_server()
+            server = self._create_http_server()
         else:
             raise ValueError(f"Unsupported MCP service: {self.mcp_service}")
+        return self._maybe_wrap_ptc(server)
 
     def _create_stdio_server(self) -> MCPStdioServer:
         """Create stdio-based MCP server."""
