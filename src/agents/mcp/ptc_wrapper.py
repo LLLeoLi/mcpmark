@@ -17,14 +17,20 @@ Because each MCPMark agent run binds to a single MCP service, there is only
 one underlying server — no ``<server>_<tool>`` prefix routing is needed.
 """
 
+import ast
 import asyncio
+import datetime as _datetime
+import difflib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
 import uuid
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 from src.logger import get_logger
 
@@ -33,7 +39,7 @@ logger = get_logger(__name__)
 
 # Persistent worker source. Talks JSON-line messages on stdin/stdout.
 _PERSISTENT_WORKER = r'''
-import os, sys, json, traceback, uuid
+import os, sys, json, csv, traceback, uuid
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
 
@@ -63,7 +69,11 @@ def _rpc_tool_call(tool_name, args, kwargs):
         if msg.get("type") == "tool_result" and msg.get("id") == req_id:
             if msg.get("ok"):
                 return msg.get("value")
-            return f"[Tool error] {msg.get('error', 'unknown error')}"
+            # Raise (rather than return an error string) so failures surface
+            # as exceptions, matching the training-time PTC sandbox where
+            # env.tools[name] raises — try/except around tool calls works and
+            # errors never flow onward disguised as data.
+            raise RuntimeError(msg.get("error", "unknown error"))
 
 
 class _ToolProxy:
@@ -97,6 +107,11 @@ def main():
         "tools": ToolCaller(),
         "WORKSPACE": workspace,
         "workspace_path": workspace,
+        # Pre-imports, matching the training-time PTC sandbox init.
+        "os": os,
+        "sys": sys,
+        "json": json,
+        "csv": csv,
     }
 
     _write_msg({"type": "ready"})
@@ -134,16 +149,24 @@ if __name__ == "__main__":
 '''
 
 
+# Kept in sync with task-sync `eval.py` / verl `tasksync_ptc_agent_loop.py`
+# (PTC_TOOL_DESCRIPTION_RICH) so deployment matches what the model saw in
+# training. Update all three together.
 _PROGRAMMATIC_TOOL_CALL_DESCRIPTION = (
-    "Execute Python code that can call env data tools via `tools[\"func_name\"](*args, **kwargs)`. "
-    "State persists across calls. Use print() for output. "
-    "Note: `tools[\"...\"]` only accesses env data tools listed above.\n\n"
-    "USE WHEN: loops, conditionals, or chaining multiple tool calls with intermediate processing.\n"
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. State (variables, imports) persists across calls; use print() to see output.\n\n'
+    "USE WHEN: loops, conditionals, error handling, or chaining multiple tool calls with intermediate processing.\n\n"
+    "Notes:\n"
+    "- Code runs in the workspace directory and file writes are restricted to it; os, json, csv, sys are pre-imported.\n"
+    "- Tools return native Python values; the type and structure vary by tool (e.g. dict, list, or str), so a quick `print(type(r), repr(r)[:200])` on one result shows the shape before processing many.\n"
+    "- Very large printed output is truncated; print summaries rather than large raw data.\n"
+    "- On an exception the traceback is returned; variables and tool side effects from lines that already ran are kept.\n"
+    "- Each call has an execution time limit; long loops can be split across calls.\n\n"
+    "Usage examples:\n\n"
     "Batch processing:\n"
     "```python\n"
     "results = []\n"
     "for region in ['West', 'East', 'Central']:\n"
-    "    data = tools[\"query_sales\"](region)\n"
+    "    data = tools[\"query_sales\"](region=region)\n"
     "    total = sum(row['revenue'] for row in data)\n"
     "    results.append((region, total))\n"
     "print(max(results, key=lambda x: x[1]))\n"
@@ -156,24 +179,117 @@ _PROGRAMMATIC_TOOL_CALL_DESCRIPTION = (
     "    print(details)\n"
     "else:\n"
     "    print('Inactive, skipped')\n"
+    "```\n\n"
+    "Error handling (tools may raise or return error payloads):\n"
+    "```python\n"
+    "ok, failed = [], []\n"
+    "for item_id in ['A001', 'A002', 'A003']:\n"
+    "    try:\n"
+    "        ok.append(tools[\"get_info\"](id=item_id))\n"
+    "    except Exception as e:\n"
+    "        failed.append((item_id, str(e)))\n"
+    "print(f'{len(ok)} ok, {len(failed)} failed:', failed[:3])\n"
     "```"
 )
 
 
-def _stringify_result(result: Any) -> Any:
-    """Best-effort flatten of an MCP CallToolResult dict to JSON / text."""
+# Whitelisted names for reconstructing Python `repr` payloads (e.g. postgres-mcp
+# returns ``str(list[dict])`` where cells may be Decimal/datetime/UUID). No
+# ``__builtins__`` — a malicious value like ``[__import__('os').system(...)]``
+# raises NameError and falls back to the raw string rather than executing.
+_REPR_EVAL_NS: Dict[str, Any] = {
+    "__builtins__": {},
+    "Decimal": Decimal,
+    "datetime": _datetime,
+    "date": _datetime.date,
+    "time": _datetime.time,
+    "timedelta": _datetime.timedelta,
+    "UUID": UUID,
+}
+
+
+def _coerce_block(text: str) -> tuple:
+    """Recover a Python value from one text block; ``(value, ok)``.
+
+    Structured payloads become native objects, plain text stays ``str``:
+
+      1. strict JSON (canonical structured channel for well-behaved servers);
+      2. a Python ``repr`` container — only attempted when the text looks like a
+         top-level ``[``/``{``/``(`` collection, so genuine prose (file contents,
+         error strings) is never mis-parsed. ``ast.literal_eval`` handles pure
+         literals; a whitelisted ``eval`` recovers ``Decimal``/``datetime``/``UUID``;
+      3. otherwise ``(text, False)`` — caller keeps it as a string.
+    """
     try:
-        content = None
+        return json.loads(text), True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if text.lstrip()[:1] not in ("[", "{", "("):
+        return text, False
+    try:
+        return ast.literal_eval(text), True
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        pass
+    try:
+        return eval(text, _REPR_EVAL_NS), True  # noqa: S307 — builtins disabled
+    except Exception:  # noqa: BLE001 — any failure => keep as string
+        return text, False
+
+
+def _is_text_envelope(structured: Any) -> bool:
+    """True when ``structuredContent`` is merely the SDK's auto-wrapper around
+    text content blocks, not real structured data.
+
+    Servers whose tools return unstructured text (e.g. postgres-mcp, which emits
+    the rows as ``str(list[dict])``) get an auto-generated
+    ``{"result": [{"type": "text", "text": "<repr>"}]}`` envelope that just
+    re-boxes the same payload already in ``content``. Returning that envelope
+    hands the model a useless nested shell instead of the rows, so we detect it
+    and fall through to parsing the text into a real native structure.
+    """
+    if not isinstance(structured, dict) or set(structured) != {"result"}:
+        return False
+    inner = structured["result"]
+    return isinstance(inner, list) and all(
+        isinstance(b, dict) and b.get("type") == "text" for b in inner
+    )
+
+
+def _stringify_result(result: Any) -> Any:
+    """Recover a *native* Python value from an MCP ``CallToolResult``.
+
+    Training-time PTC (verl ``tasksync_agent_loop``) calls ``env.tools[name]``
+    in-process and returns its native Python object, so trained models expect
+    ``tools[...]`` to yield ``dict``/``list``/scalar. Here the value has crossed
+    the MCP boundary as text content blocks, so we always parse it back into a
+    native structure and do so *deterministically* — the same tool yields the
+    same type on every call. That predictability matters: a value that is
+    "sometimes a parsed list, sometimes its raw string" makes generated code
+    guess wrong (``json.loads`` on an already-parsed list, or ``row['x']`` on an
+    unparsed string), which is exactly the failure loop native returns avoid.
+
+      1. use ``structuredContent`` when it is genuine native data — but skip the
+         SDK's text-block envelope (unwrapped and parsed via steps 2/3 instead);
+      2. coerce the joined text content *once* — JSON, then a Python ``repr``
+         container (recovering ``Decimal``/``datetime``/``UUID``);
+      3. only genuinely unparseable prose (file contents, error strings) stays
+         ``str`` — itself consistent, since such a tool always returns prose.
+    """
+    try:
         if isinstance(result, dict):
+            structured = result.get("structuredContent")
             content = result.get("content")
-        if content is None:
+        else:
+            structured = getattr(result, "structuredContent", None)
             content = getattr(result, "content", None)
+        if isinstance(structured, (dict, list)) and not _is_text_envelope(structured):
+            return structured
+
         if content is None:
             return result
 
         texts: List[str] = []
         for item in content:
-            text = None
             if isinstance(item, dict):
                 text = item.get("text")
             else:
@@ -182,11 +298,11 @@ def _stringify_result(result: Any) -> Any:
                 texts.append(text)
         if not texts:
             return result
-        joined = "\n".join(texts)
-        try:
-            return json.loads(joined)
-        except (json.JSONDecodeError, TypeError):
-            return joined
+
+        # Coerce the joined payload exactly once, so a given tool's result — and
+        # therefore its type — is deterministic across calls.
+        value, _ = _coerce_block("\n".join(texts))
+        return value
     except Exception:
         return str(result)
 
@@ -216,6 +332,8 @@ class PTCWrapper:
 
         # Tool schema cache for positional → keyword arg binding.
         self._tool_param_order: Dict[str, List[str]] = {}
+        # Tool descriptions, used to suggest candidates for unknown tool names.
+        self._tool_descriptions: Dict[str, str] = {}
 
         # Worker process state.
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -259,6 +377,7 @@ class PTCWrapper:
             props = schema.get("properties") or {}
             # JSON object key order is preserved in dict iteration (Py3.7+).
             self._tool_param_order[name] = list(props.keys())
+            self._tool_descriptions[name] = tool.get("description") or ""
 
         tools = list(tools)
         tools.append(self._programmatic_tool_call_descriptor())
@@ -304,6 +423,8 @@ class PTCWrapper:
                 ],
                 "isError": False,
             }
+        if self._tool_param_order and name not in self._tool_param_order:
+            return _ptc_text_result(self._unknown_tool_message(name))
         return await self._inner.call_tool(name, arguments)
 
     # ------------------------------------------------------------------
@@ -336,20 +457,20 @@ class PTCWrapper:
                 return _ptc_text_result(f"[ptc] worker crashed before exec: {exc}")
 
             deadline = time.monotonic() + timeout
+            timeout_msg = (
+                f"[ptc] execution timed out after {timeout}s; the Python "
+                "session was restarted and its variables were lost"
+            )
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     await self._kill_worker()
-                    return _ptc_text_result(
-                        f"[ptc] execution timed out after {timeout}s"
-                    )
+                    return _ptc_text_result(timeout_msg)
                 try:
                     msg = await self._readline(remaining)
                 except asyncio.TimeoutError:
                     await self._kill_worker()
-                    return _ptc_text_result(
-                        f"[ptc] execution timed out after {timeout}s"
-                    )
+                    return _ptc_text_result(timeout_msg)
                 if msg is None:
                     await self._kill_worker()
                     return _ptc_text_result("[ptc] worker exited without output")
@@ -368,20 +489,36 @@ class PTCWrapper:
         args = msg.get("args") or []
         kwargs = msg.get("kwargs") or {}
 
+        if tool_name in (self.PROGRAMMATIC_TOOL_CALL, self.CLAIM_DONE_TOOL):
+            # Neither recursion nor claim_done belongs inside the sandbox;
+            # previously claim_done fell through to the inner server, which
+            # replied with an opaque "Method not found".
+            await self._send({
+                "type": "tool_result", "id": req_id,
+                "ok": False,
+                "error": (
+                    f"'{tool_name}' must be invoked as a direct tool call, "
+                    "not from inside programmatic_tool_call"
+                ),
+            })
+            return
+
+        # Self-correction for hallucinated tool names: surface valid candidates
+        # instead of letting the inner server reply with an opaque
+        # "Method <name> not found".
+        if self._tool_param_order and tool_name not in self._tool_param_order:
+            await self._send({
+                "type": "tool_result", "id": req_id,
+                "ok": False, "error": self._unknown_tool_message(tool_name),
+            })
+            return
+
         try:
             bound_kwargs = self._bind_positional(tool_name, args, kwargs)
         except Exception as exc:  # noqa: BLE001
             await self._send({
                 "type": "tool_result", "id": req_id,
                 "ok": False, "error": f"argument binding failed: {exc}",
-            })
-            return
-
-        if tool_name == self.PROGRAMMATIC_TOOL_CALL:
-            await self._send({
-                "type": "tool_result", "id": req_id,
-                "ok": False,
-                "error": "programmatic_tool_call cannot call itself recursively",
             })
             return
 
@@ -426,6 +563,50 @@ class PTCWrapper:
                 f"got {len(args)}, schema declares {len(order)} parameter(s)"
             )
         return out
+
+    # ------------------------------------------------------------------
+    # Self-correction for unknown tool names.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tokenize(text: str) -> set:
+        return {t for t in re.split(r"[^a-z0-9]+", text.lower()) if t}
+
+    def _closest_tools(self, tool_name: str, n: int = 3) -> List[str]:
+        """Rank known tool names by similarity to a (probably misremembered) name.
+
+        Tool names follow a REST-verb convention (``API-post-page`` to *create* a
+        page), so a name-only fuzzy match misleads — the model's intent ("create
+        a page") lives in the description. Score each candidate on token overlap
+        against name + description, tie-broken by raw name similarity, so e.g.
+        ``API-create-a-page`` surfaces ``API-post-page`` ("Notion | Create a page").
+        """
+        wanted = self._tokenize(tool_name)
+        scored = []
+        for name in self._tool_param_order:
+            if name in (self.PROGRAMMATIC_TOOL_CALL, self.CLAIM_DONE_TOOL):
+                continue
+            tokens = self._tokenize(name) | self._tokenize(
+                self._tool_descriptions.get(name, "")
+            )
+            overlap = len(wanted & tokens) / len(wanted) if wanted else 0.0
+            name_ratio = difflib.SequenceMatcher(None, tool_name, name).ratio()
+            score = overlap + 0.3 * name_ratio
+            if score > 0:
+                scored.append((score, name))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [name for _, name in scored[:n]]
+
+    def _unknown_tool_message(self, tool_name: str) -> str:
+        suggestions = self._closest_tools(tool_name)
+        if suggestions:
+            hint = "Did you mean: " + ", ".join(suggestions) + "?"
+        else:
+            hint = "See the available tools list for valid names."
+        return (
+            f"Unknown tool '{tool_name}'. {hint} "
+            "Tool names must match the listed names exactly."
+        )
 
     # ------------------------------------------------------------------
     # Worker lifecycle.
@@ -497,6 +678,26 @@ class PTCWrapper:
             pass
 
 
+# Cap on the output a single programmatic_tool_call may return (chars). Agents
+# occasionally print entire fetched datasets (hundreds of KB), which poisons
+# the context. 0 disables. Mirrors the training-side sandbox cap
+# (verl landlock_sandbox / task-sync python_sandbox).
+_MAX_OUTPUT_CHARS = int(os.getenv("MCPMARK_PTC_MAX_OUTPUT_CHARS", "10000"))
+
+
+def _truncate_output(text: str, limit: int) -> str:
+    """Middle-truncate `text` to ~`limit` chars, keeping head and tail."""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (
+        f"{text[:head]}\n...[output truncated: {omitted} chars omitted; "
+        f"print concise summaries instead of large raw data]...\n{text[-tail:]}"
+    )
+
+
 def _ptc_text_result(text: str) -> Dict[str, Any]:
     """Shape a plain string as an MCP CallToolResult-like dict."""
     return {"content": [{"type": "text", "text": text}], "isError": True}
@@ -511,7 +712,7 @@ def _format_exec_result(msg: Dict[str, Any]) -> Dict[str, Any]:
         parts.append("STDERR:\n" + str(msg["stderr"]))
     if msg.get("error"):
         parts.append("ERROR:\n" + str(msg["error"]))
-    text = "\n".join(parts) if parts else ""
+    text = _truncate_output("\n".join(parts) if parts else "", _MAX_OUTPUT_CHARS)
     return {
         "content": [{"type": "text", "text": text}],
         "isError": bool(msg.get("error")),
