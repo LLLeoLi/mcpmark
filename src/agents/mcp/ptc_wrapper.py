@@ -70,9 +70,8 @@ def _rpc_tool_call(tool_name, args, kwargs):
             if msg.get("ok"):
                 return msg.get("value")
             # Raise (rather than return an error string) so failures surface
-            # as exceptions, matching the training-time PTC sandbox where
-            # env.tools[name] raises — try/except around tool calls works and
-            # errors never flow onward disguised as data.
+            # as exceptions — try/except around tool calls works and errors
+            # never flow onward disguised as data.
             raise RuntimeError(msg.get("error", "unknown error"))
 
 
@@ -107,7 +106,7 @@ def main():
         "tools": ToolCaller(),
         "WORKSPACE": workspace,
         "workspace_path": workspace,
-        # Pre-imports, matching the training-time PTC sandbox init.
+        # Pre-imports, as promised in the tool description.
         "os": os,
         "sys": sys,
         "json": json,
@@ -149,9 +148,6 @@ if __name__ == "__main__":
 '''
 
 
-# Kept in sync with task-sync `eval.py` / verl `tasksync_ptc_agent_loop.py`
-# (PTC_TOOL_DESCRIPTION_RICH) so deployment matches what the model saw in
-# training. Update all three together.
 _PROGRAMMATIC_TOOL_CALL_DESCRIPTION = (
     'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. State (variables, imports) persists across calls; use print() to see output.\n\n'
     "USE WHEN: loops, conditionals, error handling, or chaining multiple tool calls with intermediate processing.\n\n"
@@ -258,15 +254,13 @@ def _is_text_envelope(structured: Any) -> bool:
 def _stringify_result(result: Any) -> Any:
     """Recover a *native* Python value from an MCP ``CallToolResult``.
 
-    Training-time PTC (verl ``tasksync_agent_loop``) calls ``env.tools[name]``
-    in-process and returns its native Python object, so trained models expect
-    ``tools[...]`` to yield ``dict``/``list``/scalar. Here the value has crossed
-    the MCP boundary as text content blocks, so we always parse it back into a
-    native structure and do so *deterministically* — the same tool yields the
-    same type on every call. That predictability matters: a value that is
-    "sometimes a parsed list, sometimes its raw string" makes generated code
-    guess wrong (``json.loads`` on an already-parsed list, or ``row['x']`` on an
-    unparsed string), which is exactly the failure loop native returns avoid.
+    The tool's payload crossed the MCP boundary boxed into text content
+    blocks, so we always parse it back into a native ``dict``/``list``/scalar
+    and do so *deterministically* — the same tool yields the same type on
+    every call. That predictability matters: a value that is "sometimes a
+    parsed list, sometimes its raw string" makes generated code guess wrong
+    (``json.loads`` on an already-parsed list, or ``row['x']`` on an unparsed
+    string), which is exactly the failure loop native returns avoid.
 
       1. use ``structuredContent`` when it is genuine native data — but skip the
          SDK's text-block envelope (unwrapped and parsed via steps 2/3 instead);
@@ -282,29 +276,66 @@ def _stringify_result(result: Any) -> Any:
         else:
             structured = getattr(result, "structuredContent", None)
             content = getattr(result, "content", None)
-        if isinstance(structured, (dict, list)) and not _is_text_envelope(structured):
-            return structured
-
-        if content is None:
-            return result
-
         texts: List[str] = []
-        for item in content:
+        for item in content or ():
             if isinstance(item, dict):
                 text = item.get("text")
             else:
                 text = getattr(item, "text", None)
             if text is not None:
                 texts.append(text)
+        joined = "\n".join(texts) if texts else None
+
+        if isinstance(structured, (dict, list)) and not _is_text_envelope(structured):
+            # A single-key dict whose value merely re-boxes the joined text
+            # (filesystem-mcp emits {"content": "<same text>"}) is another
+            # duplication wrapper, not real structured data — skip it so prose
+            # tools keep returning plain strings.
+            rebox = (
+                isinstance(structured, dict)
+                and len(structured) == 1
+                and joined is not None
+                and next(iter(structured.values())) == joined
+            )
+            if not rebox:
+                return structured
+
         if not texts:
             return result
 
         # Coerce the joined payload exactly once, so a given tool's result — and
         # therefore its type — is deterministic across calls.
-        value, _ = _coerce_block("\n".join(texts))
+        value, _ = _coerce_block(joined)
         return value
     except Exception:
         return str(result)
+
+
+def _jsonify(value: Any) -> Any:
+    """Reduce a recovered value to JSON-clean types.
+
+    Sandbox code only ever sees str/int/float/bool/None inside plain
+    list/dict containers: Decimal→float, datetime/date/time→ISO string,
+    tuple/set→list; anything else degrades to str(). Total function, so the
+    result always survives json.dumps — both on the worker pipe and in the
+    agent's tool-message serialization.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonify(v) for v in value]
+    if isinstance(value, dict):
+        return {
+            (k if isinstance(k, str) else str(k)): _jsonify(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (_datetime.datetime, _datetime.date, _datetime.time)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
 
 
 _CLAIM_DONE_DESCRIPTION = (
@@ -425,7 +456,12 @@ class PTCWrapper:
             }
         if self._tool_param_order and name not in self._tool_param_order:
             return _ptc_text_result(self._unknown_tool_message(name))
-        return await self._inner.call_tool(name, arguments)
+        raw = await self._inner.call_tool(name, arguments)
+        # Direct calls hand back the same canonical value the PTC sandbox
+        # sees; the agent json.dumps it, so the model reads clean JSON rows
+        # instead of a CallToolResult envelope and the two channels always
+        # show identical data.
+        return _jsonify(_stringify_result(raw))
 
     # ------------------------------------------------------------------
     # programmatic_tool_call implementation.
@@ -524,7 +560,7 @@ class PTCWrapper:
 
         try:
             raw = await self._inner.call_tool(tool_name, bound_kwargs)
-            value = _stringify_result(raw)
+            value = _jsonify(_stringify_result(raw))
             reply = {"type": "tool_result", "id": req_id, "ok": True, "value": value}
         except Exception as exc:  # noqa: BLE001
             reply = {
@@ -536,6 +572,17 @@ class PTCWrapper:
             await self._send(reply)
         except (BrokenPipeError, ConnectionResetError, OSError):
             await self._kill_worker()
+        except (TypeError, ValueError) as exc:
+            # A value _jsonify missed. The worker is still blocked on this
+            # req_id — answer with an error rather than leaving the protocol
+            # desynced (which turns every later call into a timeout).
+            try:
+                await self._send({
+                    "type": "tool_result", "id": req_id, "ok": False,
+                    "error": f"tool result could not be serialized: {exc}",
+                })
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                await self._kill_worker()
 
     def _bind_positional(
         self, tool_name: str, args: List[Any], kwargs: Dict[str, Any]
@@ -680,8 +727,7 @@ class PTCWrapper:
 
 # Cap on the output a single programmatic_tool_call may return (chars). Agents
 # occasionally print entire fetched datasets (hundreds of KB), which poisons
-# the context. 0 disables. Mirrors the training-side sandbox cap
-# (verl landlock_sandbox / task-sync python_sandbox).
+# the context. 0 disables.
 _MAX_OUTPUT_CHARS = int(os.getenv("MCPMARK_PTC_MAX_OUTPUT_CHARS", "10000"))
 
 
