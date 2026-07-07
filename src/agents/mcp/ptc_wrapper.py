@@ -311,6 +311,31 @@ def _stringify_result(result: Any) -> Any:
         return str(result)
 
 
+def _result_error_text(result: Any) -> Optional[str]:
+    """Return the error message when an MCP ``CallToolResult`` signals failure.
+
+    MCP servers report tool failures with ``isError: True`` on an *otherwise
+    normal* result — they do **not** raise. postgres-mcp in particular returns
+    SQL errors this way, as plain text in ``content``. If a caller only treats
+    Python exceptions as failures, that error text flows onward disguised as
+    data: generated sandbox code then iterates the error string, subscripts it
+    as if it were a row, and its ``try/except`` never fires.
+
+    So both PTC channels must inspect this flag. Returns the extracted error
+    text when ``isError`` is set, otherwise ``None``.
+    """
+    if isinstance(result, dict):
+        is_err = result.get("isError")
+    else:
+        is_err = getattr(result, "isError", None)
+    if not is_err:
+        return None
+    text = _stringify_result(result)
+    if not isinstance(text, str):
+        text = repr(text)
+    return text or "tool reported an error (isError) with no message"
+
+
 def _jsonify(value: Any) -> Any:
     """Reduce a recovered value to JSON-clean types.
 
@@ -457,10 +482,6 @@ class PTCWrapper:
         if self._tool_param_order and name not in self._tool_param_order:
             return _ptc_text_result(self._unknown_tool_message(name))
         raw = await self._inner.call_tool(name, arguments)
-        # Direct calls hand back the same canonical value the PTC sandbox
-        # sees; the agent json.dumps it, so the model reads clean JSON rows
-        # instead of a CallToolResult envelope and the two channels always
-        # show identical data.
         return _jsonify(_stringify_result(raw))
 
     # ------------------------------------------------------------------
@@ -560,9 +581,15 @@ class PTCWrapper:
 
         try:
             raw = await self._inner.call_tool(tool_name, bound_kwargs)
-            value = _jsonify(_stringify_result(raw))
-            reply = {"type": "tool_result", "id": req_id, "ok": True, "value": value}
-        except Exception as exc:  # noqa: BLE001
+            err = _result_error_text(raw)
+            if err is not None:
+                # An MCP-level failure (isError) — surface it as ok:False so the
+                # worker raises, instead of returning the error text as a value.
+                reply = {"type": "tool_result", "id": req_id, "ok": False, "error": err}
+            else:
+                value = _jsonify(_stringify_result(raw))
+                reply = {"type": "tool_result", "id": req_id, "ok": True, "value": value}
+        except Exception as exc:
             reply = {
                 "type": "tool_result", "id": req_id,
                 "ok": False, "error": f"{type(exc).__name__}: {exc}",
