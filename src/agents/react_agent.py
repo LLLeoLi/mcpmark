@@ -11,6 +11,7 @@ import litellm
 
 from src.logger import get_logger
 from .base_agent import BaseMCPAgent
+from .mcp.ptc_wrapper import result_to_observation
 
 logger = get_logger(__name__)
 
@@ -502,6 +503,10 @@ class ReActAgent(BaseMCPAgent):
             return {}
 
     def _tool_result_to_text(self, result: Any) -> str:
+        if self.ptc:
+            # PTC envelopes unwrap to their plain sandbox text so the model
+            # sees the same observation channel as verl's tasksync loop.
+            return result_to_observation(result)
         if result is None:
             return ""
         if isinstance(result, str):

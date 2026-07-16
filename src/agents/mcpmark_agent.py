@@ -18,7 +18,7 @@ import nest_asyncio
 from src.logger import get_logger
 from .base_agent import BaseMCPAgent
 from .mcp import MCPStdioServer, MCPHttpServer
-from .mcp.ptc_wrapper import PTCWrapper
+from .mcp.ptc_wrapper import PTCWrapper, result_to_observation
 
 # Apply nested asyncio support
 nest_asyncio.apply()
@@ -75,6 +75,19 @@ class CustomJSONEncoder(json.JSONEncoder):
         if isinstance(obj, AnyUrl):
             return str(obj)
         return super().default(obj)
+
+
+def _serialize_tool_result(result: Any, ptc: bool) -> str:
+    """Serialize a ``call_tool`` result into the tool-message text.
+
+    Under PTC this must match verl's tasksync channel (see
+    ``result_to_observation``): PTC envelopes become their plain sandbox
+    text and other values are JSON-encoded without ASCII escaping. The
+    non-PTC baseline serialization is deliberately left byte-identical.
+    """
+    if ptc:
+        return result_to_observation(result)
+    return json.dumps(result, cls=CustomJSONEncoder)
 
 
 class MCPMarkAgent(BaseMCPAgent):
@@ -762,7 +775,7 @@ class MCPMarkAgent(BaseMCPAgent):
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": json.dumps(result, cls=CustomJSONEncoder),
+                                    "text": _serialize_tool_result(result, self.ptc),
                                 }
                             ],
                         }
@@ -1128,8 +1141,8 @@ class MCPMarkAgent(BaseMCPAgent):
                                 {
                                     "role": "tool",
                                     "tool_call_id": tool_call.id,
-                                    "content": json.dumps(
-                                        result, cls=CustomJSONEncoder
+                                    "content": _serialize_tool_result(
+                                        result, self.ptc
                                     ),
                                 }
                             )

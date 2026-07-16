@@ -19,6 +19,7 @@ one underlying server — no ``<server>_<tool>`` prefix routing is needed.
 
 import ast
 import asyncio
+import base64
 import datetime as _datetime
 import difflib
 import json
@@ -40,11 +41,87 @@ logger = get_logger(__name__)
 # Persistent worker source. Talks JSON-line messages on stdin/stdout.
 _PERSISTENT_WORKER = r'''
 import os, sys, json, csv, traceback, uuid
+import base64 as _b64
+import datetime as _dt
+import decimal as _decimal
+import uuid as _uuid_mod
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
 
 _proto_out = sys.stdout
 _proto_in = sys.stdin
+
+
+# Typed-pipe codec (mirrors _encode_pipe/_decode_pipe in the parent): lets
+# tool results reach user code as real Decimal/datetime/UUID/tuple/... objects
+# instead of their JSON degradations, matching in-process tool semantics.
+def _encode_pipe(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, _decimal.Decimal):
+        return {"__ptc__": "Decimal", "v": str(v)}
+    if isinstance(v, _dt.datetime):
+        return {"__ptc__": "datetime", "v": v.isoformat()}
+    if isinstance(v, _dt.date):
+        return {"__ptc__": "date", "v": v.isoformat()}
+    if isinstance(v, _dt.time):
+        return {"__ptc__": "time", "v": v.isoformat()}
+    if isinstance(v, _dt.timedelta):
+        return {"__ptc__": "timedelta", "v": v.total_seconds()}
+    if isinstance(v, _uuid_mod.UUID):
+        return {"__ptc__": "UUID", "v": str(v)}
+    if isinstance(v, tuple):
+        return {"__ptc__": "tuple", "v": [_encode_pipe(x) for x in v]}
+    if isinstance(v, frozenset):
+        return {"__ptc__": "frozenset", "v": [_encode_pipe(x) for x in v]}
+    if isinstance(v, set):
+        return {"__ptc__": "set", "v": [_encode_pipe(x) for x in v]}
+    if isinstance(v, (bytes, bytearray)):
+        return {"__ptc__": "bytes", "v": _b64.b64encode(bytes(v)).decode("ascii")}
+    if isinstance(v, list):
+        return [_encode_pipe(x) for x in v]
+    if isinstance(v, dict):
+        enc = {(k if isinstance(k, str) else str(k)): _encode_pipe(x)
+               for k, x in v.items()}
+        if set(enc) == {"__ptc__", "v"}:  # collision guard for real dicts
+            return {"__ptc__": "dict", "v": enc}
+        return enc
+    return str(v)
+
+
+def _decode_pipe(v):
+    if isinstance(v, list):
+        return [_decode_pipe(x) for x in v]
+    if isinstance(v, dict):
+        if set(v) == {"__ptc__", "v"}:
+            tag, val = v["__ptc__"], v["v"]
+            try:
+                if tag == "Decimal":
+                    return _decimal.Decimal(val)
+                if tag == "datetime":
+                    return _dt.datetime.fromisoformat(val)
+                if tag == "date":
+                    return _dt.date.fromisoformat(val)
+                if tag == "time":
+                    return _dt.time.fromisoformat(val)
+                if tag == "timedelta":
+                    return _dt.timedelta(seconds=val)
+                if tag == "UUID":
+                    return _uuid_mod.UUID(val)
+                if tag == "tuple":
+                    return tuple(_decode_pipe(x) for x in val)
+                if tag == "set":
+                    return set(_decode_pipe(x) for x in val)
+                if tag == "frozenset":
+                    return frozenset(_decode_pipe(x) for x in val)
+                if tag == "bytes":
+                    return _b64.b64decode(val)
+                if tag == "dict":
+                    return {k: _decode_pipe(x) for k, x in val.items()}
+            except (ValueError, TypeError):
+                return val
+        return {k: _decode_pipe(x) for k, x in v.items()}
+    return v
 
 
 def _read_msg():
@@ -61,14 +138,18 @@ def _write_msg(msg):
 
 def _rpc_tool_call(tool_name, args, kwargs):
     req_id = uuid.uuid4().hex
+    # Encode args/kwargs as whole containers (not per-item) so the encoder's
+    # collision guard also protects a kwargs dict whose keys happen to be
+    # exactly {"__ptc__", "v"} — the parent decodes the same whole containers.
     _write_msg({"type": "tool_call", "id": req_id,
                 "tool_name": tool_name,
-                "args": list(args), "kwargs": kwargs})
+                "args": _encode_pipe(list(args)),
+                "kwargs": _encode_pipe(dict(kwargs))})
     while True:
         msg = _read_msg()
         if msg.get("type") == "tool_result" and msg.get("id") == req_id:
             if msg.get("ok"):
-                return msg.get("value")
+                return _decode_pipe(msg.get("value"))
             # Raise (rather than return an error string) so failures surface
             # as exceptions — try/except around tool calls works and errors
             # never flow onward disguised as data.
@@ -336,6 +417,88 @@ def _result_error_text(result: Any) -> Optional[str]:
     return text or "tool reported an error (isError) with no message"
 
 
+def _encode_pipe(value: Any) -> Any:
+    """Encode a recovered value for the worker pipe, preserving type identity.
+
+    JSON-native values pass through; Decimal/datetime/date/time/timedelta/
+    UUID/tuple/set/frozenset/bytes are boxed as ``{"__ptc__": tag, "v": ...}``
+    and rebuilt into the *same* Python types by the worker's ``_decode_pipe``
+    — so sandbox code sees what an in-process tool call would have returned
+    (e.g. a postgres ``Decimal`` stays a ``Decimal``, not a float). Total
+    function: anything unrecognized degrades to ``str()``.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Decimal):
+        return {"__ptc__": "Decimal", "v": str(value)}
+    if isinstance(value, _datetime.datetime):
+        return {"__ptc__": "datetime", "v": value.isoformat()}
+    if isinstance(value, _datetime.date):
+        return {"__ptc__": "date", "v": value.isoformat()}
+    if isinstance(value, _datetime.time):
+        return {"__ptc__": "time", "v": value.isoformat()}
+    if isinstance(value, _datetime.timedelta):
+        return {"__ptc__": "timedelta", "v": value.total_seconds()}
+    if isinstance(value, UUID):
+        return {"__ptc__": "UUID", "v": str(value)}
+    if isinstance(value, tuple):
+        return {"__ptc__": "tuple", "v": [_encode_pipe(x) for x in value]}
+    if isinstance(value, frozenset):
+        return {"__ptc__": "frozenset", "v": [_encode_pipe(x) for x in value]}
+    if isinstance(value, set):
+        return {"__ptc__": "set", "v": [_encode_pipe(x) for x in value]}
+    if isinstance(value, (bytes, bytearray)):
+        return {"__ptc__": "bytes", "v": base64.b64encode(bytes(value)).decode("ascii")}
+    if isinstance(value, list):
+        return [_encode_pipe(x) for x in value]
+    if isinstance(value, dict):
+        enc = {
+            (k if isinstance(k, str) else str(k)): _encode_pipe(v)
+            for k, v in value.items()
+        }
+        if set(enc) == {"__ptc__", "v"}:  # collision guard for real dicts
+            return {"__ptc__": "dict", "v": enc}
+        return enc
+    return str(value)
+
+
+def _decode_pipe(value: Any) -> Any:
+    """Inverse of the worker's ``_encode_pipe`` for values arriving from the
+    sandbox (tool-call args). Unknown tags decode to their raw payload."""
+    if isinstance(value, list):
+        return [_decode_pipe(x) for x in value]
+    if isinstance(value, dict):
+        if set(value) == {"__ptc__", "v"}:
+            tag, val = value["__ptc__"], value["v"]
+            try:
+                if tag == "Decimal":
+                    return Decimal(val)
+                if tag == "datetime":
+                    return _datetime.datetime.fromisoformat(val)
+                if tag == "date":
+                    return _datetime.date.fromisoformat(val)
+                if tag == "time":
+                    return _datetime.time.fromisoformat(val)
+                if tag == "timedelta":
+                    return _datetime.timedelta(seconds=val)
+                if tag == "UUID":
+                    return UUID(val)
+                if tag == "tuple":
+                    return tuple(_decode_pipe(x) for x in val)
+                if tag == "set":
+                    return set(_decode_pipe(x) for x in val)
+                if tag == "frozenset":
+                    return frozenset(_decode_pipe(x) for x in val)
+                if tag == "bytes":
+                    return base64.b64decode(val)
+                if tag == "dict":
+                    return {k: _decode_pipe(x) for k, x in val.items()}
+            except (ValueError, TypeError):
+                return val
+        return {k: _decode_pipe(x) for k, x in value.items()}
+    return value
+
+
 def _jsonify(value: Any) -> Any:
     """Reduce a recovered value to JSON-clean types.
 
@@ -543,8 +706,8 @@ class PTCWrapper:
     async def _handle_tool_call(self, msg: Dict[str, Any]) -> None:
         req_id = msg.get("id")
         tool_name = msg.get("tool_name") or ""
-        args = msg.get("args") or []
-        kwargs = msg.get("kwargs") or {}
+        args = _decode_pipe(msg.get("args") or [])
+        kwargs = _decode_pipe(msg.get("kwargs") or {})
 
         if tool_name in (self.PROGRAMMATIC_TOOL_CALL, self.CLAIM_DONE_TOOL):
             # Neither recursion nor claim_done belongs inside the sandbox;
@@ -580,14 +743,20 @@ class PTCWrapper:
             return
 
         try:
-            raw = await self._inner.call_tool(tool_name, bound_kwargs)
+            # MCP arguments must be JSON-clean; degrade rich arg types (a
+            # Decimal the sandbox passed back in) the same way verl's JSON
+            # tool boundary would.
+            raw = await self._inner.call_tool(tool_name, _jsonify(bound_kwargs))
             err = _result_error_text(raw)
             if err is not None:
                 # An MCP-level failure (isError) — surface it as ok:False so the
                 # worker raises, instead of returning the error text as a value.
                 reply = {"type": "tool_result", "id": req_id, "ok": False, "error": err}
             else:
-                value = _jsonify(_stringify_result(raw))
+                # Typed-pipe encoding (not _jsonify): Decimal/datetime/tuple/…
+                # recovered from the MCP payload arrive in the sandbox as real
+                # Python objects, matching in-process tool-call semantics.
+                value = _encode_pipe(_stringify_result(raw))
                 reply = {"type": "tool_result", "id": req_id, "ok": True, "value": value}
         except Exception as exc:
             reply = {
@@ -774,6 +943,32 @@ def _truncate_output(text: str, limit: int) -> str:
 def _ptc_text_result(text: str) -> Dict[str, Any]:
     """Shape a plain string as an MCP CallToolResult-like dict."""
     return {"content": [{"type": "text", "text": text}], "isError": True}
+
+
+def result_to_observation(result: Any) -> str:
+    """Render a ``call_tool`` result as the observation string the model sees.
+
+    Matches verl's tasksync observation channel: a PTC envelope
+    (``{"content": [...], "isError": ...}`` from ``programmatic_tool_call`` /
+    ``claim_done``) unwraps to its plain text — the model reads the sandbox
+    output itself, not a JSON shell around it. Every other value is
+    JSON-encoded with ``ensure_ascii=False`` so non-ASCII text reaches the
+    model verbatim instead of as ``\\uXXXX`` escapes.
+    """
+    if (
+        isinstance(result, dict)
+        and set(result) == {"content", "isError"}
+        and isinstance(result["content"], list)
+        and all(
+            isinstance(b, dict) and b.get("type") == "text"
+            for b in result["content"]
+        )
+    ):
+        return "\n".join(b.get("text", "") for b in result["content"])
+    try:
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(result)
 
 
 def _format_exec_result(msg: Dict[str, Any]) -> Dict[str, Any]:
