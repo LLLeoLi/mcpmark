@@ -183,7 +183,10 @@ class BaseMCPAgent(ABC):
             or self.service_config.get("workspace")
         )
         return PTCWrapper(
-            server, workspace=workspace, default_code_timeout=self.ptc_timeout
+            server,
+            workspace=workspace,
+            default_code_timeout=self.ptc_timeout,
+            service=self.mcp_service,
         )
 
     def _create_stdio_server(self) -> MCPStdioServer:
@@ -250,8 +253,8 @@ class BaseMCPAgent(ABC):
                 f"postgresql://{username}:{password}@{host}:{port}/{database}"
             )
             return MCPStdioServer(
-                command="pipx",
-                args=["run", "postgres-mcp==0.3.0", "--access-mode=unrestricted"],
+                command="postgres-mcp",
+                args=["--access-mode=unrestricted"],
                 env={"DATABASE_URI": database_url},
             )
 

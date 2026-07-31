@@ -230,45 +230,40 @@ if __name__ == "__main__":
 
 
 _PROGRAMMATIC_TOOL_CALL_DESCRIPTION = (
-    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. State (variables, imports) persists across calls; use print() to see output.\n\n'
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. State (variables, imports) persists across calls. Use print() to see output.\n'
     "USE WHEN: loops, conditionals, error handling, or chaining multiple tool calls with intermediate processing.\n\n"
     "Notes:\n"
-    "- Code runs in the workspace directory and file writes are restricted to it; os, json, csv, sys are pre-imported.\n"
-    "- Tools return native Python values; the type and structure vary by tool (e.g. dict, list, or str), so a quick `print(type(r), repr(r)[:200])` on one result shows the shape before processing many.\n"
+    "- Code runs in the workspace directory and file writes are restricted to it, don't write to `/tmp`; always use absolute paths for file writes; os, json, csv, sys are pre-imported.\n"
+    "- Tools return native Python values; the type and structure vary by tool (e.g. dict, list, or str). Always print and inspect the first result before processing many items; do not assume a result is a list and loop over it.\n"
     "- Very large printed output is truncated; print summaries rather than large raw data.\n"
-    "- On an exception the traceback is returned; variables and tool side effects from lines that already ran are kept.\n"
-    "- Each call has an execution time limit; long loops can be split across calls.\n\n"
+    "- Tools may raise an exception; wrap calls in try/except to handle failures.\n"
     "Usage examples:\n\n"
-    "Batch processing:\n"
+    "Batch + conditional workflow:\n"
     "```python\n"
+    "print(type(tools[\"get_info\"](id='A001')))  # inspect return type first, then loop\n"
     "results = []\n"
-    "for region in ['West', 'East', 'Central']:\n"
-    "    data = tools[\"query_sales\"](region=region)\n"
-    "    total = sum(row['revenue'] for row in data)\n"
-    "    results.append((region, total))\n"
-    "print(max(results, key=lambda x: x[1]))\n"
+    "for item in ['A001', 'A002', 'A003']:\n"
+    "    info = tools[\"get_info\"](id=item)\n"
+    "    if info.get('status') == 'active': # info is a dict, confirmed above\n"
+    "        results.append(tools[\"get_details\"](id=item))\n"
+    "    else:\n"
+    "        print(f'Skipping {item}')\n"
+    "    print(f'Processed {item}')\n"
+    "print('Collected', len(results))\n"
     "```\n\n"
-    "Conditional workflow:\n"
-    "```python\n"
-    "info = tools[\"get_info\"](id='A001')\n"
-    "if info['status'] == 'active':\n"
-    "    details = tools[\"get_details\"](id='A001')\n"
-    "    print(details)\n"
-    "else:\n"
-    "    print('Inactive, skipped')\n"
-    "```\n\n"
-    "Error handling (tools may raise or return error payloads):\n"
+    "Error handling:\n"
     "```python\n"
     "ok, failed = [], []\n"
     "for item_id in ['A001', 'A002', 'A003']:\n"
     "    try:\n"
-    "        ok.append(tools[\"get_info\"](id=item_id))\n"
+    "        r = tools[\"get_info\"](id=item_id)\n"
+    "        ok.append(r)\n"
     "    except Exception as e:\n"
     "        failed.append((item_id, str(e)))\n"
-    "print(f'{len(ok)} ok, {len(failed)} failed:', failed[:3])\n"
+    "    print(f'{len(ok)} ok, {len(failed)} failed')\n"
+    "print('Failed:', failed[:3] if failed else 'none')\n"
     "```"
 )
-
 
 # Whitelisted names for reconstructing Python `repr` payloads (e.g. postgres-mcp
 # returns ``str(list[dict])`` where cells may be Decimal/datetime/UUID). No
@@ -392,29 +387,40 @@ def _stringify_result(result: Any) -> Any:
         return str(result)
 
 
-def _result_error_text(result: Any) -> Optional[str]:
+def _result_error_text(result: Any, service: Optional[str] = None) -> Optional[str]:
     """Return the error message when an MCP ``CallToolResult`` signals failure.
 
-    MCP servers report tool failures with ``isError: True`` on an *otherwise
-    normal* result — they do **not** raise. postgres-mcp in particular returns
-    SQL errors this way, as plain text in ``content``. If a caller only treats
-    Python exceptions as failures, that error text flows onward disguised as
-    data: generated sandbox code then iterates the error string, subscripts it
-    as if it were a row, and its ``try/except`` never fires.
+    Two failure conventions must be caught, or the error text flows onward
+    disguised as data — generated sandbox code then subscripts the error string
+    as if it were a row and its ``try/except`` never fires:
 
-    So both PTC channels must inspect this flag. Returns the extracted error
-    text when ``isError`` is set, otherwise ``None``.
+    1. ``isError: True`` on an *otherwise normal* result. The official
+       ``server-filesystem`` reports failures this way (it does **not** raise).
+    2. postgres-mcp is worse: it leaves ``isError`` **unset/false** and returns
+       the SQL error as plain text whose first line is ``Error: ...``. Only a
+       payload that stays a ``str`` after coercion (a successful query always
+       coerces to a ``list``/``dict``) and starts with ``Error:`` is treated as
+       a failure, and only for the postgres service — filesystem returns prose
+       routinely, so this prefix rule must not apply to it.
+
+    Returns the extracted error text on failure, otherwise ``None``.
     """
     if isinstance(result, dict):
         is_err = result.get("isError")
     else:
         is_err = getattr(result, "isError", None)
-    if not is_err:
-        return None
-    text = _stringify_result(result)
-    if not isinstance(text, str):
-        text = repr(text)
-    return text or "tool reported an error (isError) with no message"
+    if is_err:
+        text = _stringify_result(result)
+        if not isinstance(text, str):
+            text = repr(text)
+        return text or "tool reported an error (isError) with no message"
+
+    if service == "postgres":
+        value = _stringify_result(result)
+        if isinstance(value, str) and value.lstrip().startswith("Error:"):
+            return value
+
+    return None
 
 
 def _encode_pipe(value: Any) -> Any:
@@ -544,10 +550,14 @@ class PTCWrapper:
         inner: Any,
         workspace: Optional[str] = None,
         default_code_timeout: int = 60,
+        service: Optional[str] = None,
     ):
         self._inner = inner
         self._workspace = os.path.abspath(workspace) if workspace else os.getcwd()
         self._default_code_timeout = int(default_code_timeout)
+        # MCP service name (e.g. "postgres"). Some servers report failures as
+        # plain text with ``isError`` unset — see ``_result_error_text``.
+        self._service = service
 
         # Tool schema cache for positional → keyword arg binding.
         self._tool_param_order: Dict[str, List[str]] = {}
@@ -747,7 +757,7 @@ class PTCWrapper:
             # Decimal the sandbox passed back in) the same way verl's JSON
             # tool boundary would.
             raw = await self._inner.call_tool(tool_name, _jsonify(bound_kwargs))
-            err = _result_error_text(raw)
+            err = _result_error_text(raw, self._service)
             if err is not None:
                 # An MCP-level failure (isError) — surface it as ok:False so the
                 # worker raises, instead of returning the error text as a value.
@@ -919,6 +929,19 @@ class PTCWrapper:
             await proc.wait()
         except (ProcessLookupError, OSError):
             pass
+
+    async def reset_worker(self) -> None:
+        """Kill the PTC worker so the next call starts a fresh one.
+
+        Called by the agent loop after a tool call times out at the outer
+        boundary: cancelling that ``call_tool`` releases ``_proc_lock`` but
+        leaves the worker subprocess wedged in ``_read_msg`` waiting for a
+        tool_result that will never arrive. ``_ensure_worker`` would then
+        reuse the live-but-dead process, so every later call also times out.
+        Killing it here forces a clean restart. No-op if no worker is running.
+        """
+        async with self._proc_lock:
+            await self._kill_worker()
 
 
 # Cap on the output a single programmatic_tool_call may return (chars). Agents

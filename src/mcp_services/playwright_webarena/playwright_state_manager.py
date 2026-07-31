@@ -57,7 +57,7 @@ class PlaywrightStateManager(BaseStateManager):
         "reddit": {
             "image_name": "postmill-populated-exposed-withimg",
             "container_name": "forum",
-            "host_port": 9999,
+            "host_port": 9998,
             "readiness_path": "/"
         },
         "shopping": {
