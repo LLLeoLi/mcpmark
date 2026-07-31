@@ -120,6 +120,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--ptc-only",
+        action="store_true",
+        help=(
+            "PTC-only mode (implies --ptc): the environment's native tools remain "
+            "listed so the model can read their schemas, but calling them directly "
+            "is rejected — they can only be invoked via tools[...] inside "
+            "`programmatic_tool_call`. Runs land under `<svc>-ptc-only/`."
+        ),
+    )
+    parser.add_argument(
         "--ptc-timeout",
         type=int,
         default=60,
@@ -211,6 +221,7 @@ def main():
                 compaction_token=args.compaction_token,
                 ptc=args.ptc,
                 ptc_timeout=args.ptc_timeout,
+                ptc_only=args.ptc_only,
             )
 
             pipeline.run_evaluation(args.tasks)

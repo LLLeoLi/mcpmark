@@ -265,6 +265,17 @@ _PROGRAMMATIC_TOOL_CALL_DESCRIPTION = (
     "```"
 )
 
+# PTC-only variant (verbatim from verl task-sync `PTC_TOOL_DESCRIPTION_ONLY`):
+# same body as the description above, but the opening line emphasizes PTC is
+# the ONLY way to invoke env tools. Body is reused so the two stay in sync.
+_PROGRAMMATIC_TOOL_CALL_DESCRIPTION_ONLY = (
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. '
+    "**This is the ONLY way to invoke env tools** — they cannot be called as standalone tool "
+    "calls, so every env tool must go through this sandbox. "
+    "State (variables, imports) persists across calls. Use print() to see output.\n"
+    + _PROGRAMMATIC_TOOL_CALL_DESCRIPTION.split("\n", 1)[1]
+)
+
 # Whitelisted names for reconstructing Python `repr` payloads (e.g. postgres-mcp
 # returns ``str(list[dict])`` where cells may be Decimal/datetime/UUID). No
 # ``__builtins__`` — a malicious value like ``[__import__('os').system(...)]``
@@ -551,6 +562,7 @@ class PTCWrapper:
         workspace: Optional[str] = None,
         default_code_timeout: int = 60,
         service: Optional[str] = None,
+        ptc_only: bool = False,
     ):
         self._inner = inner
         self._workspace = os.path.abspath(workspace) if workspace else os.getcwd()
@@ -558,6 +570,10 @@ class PTCWrapper:
         # MCP service name (e.g. "postgres"). Some servers report failures as
         # plain text with ``isError`` unset — see ``_result_error_text``.
         self._service = service
+        # PTC-only mode (mirrors verl task-sync --only-ptc): the inner tools
+        # stay listed so the model can read their schemas, but they can only be
+        # invoked via the sandbox's ``tools`` object — direct calls are rejected.
+        self._ptc_only = bool(ptc_only)
 
         # Tool schema cache for positional → keyword arg binding.
         self._tool_param_order: Dict[str, List[str]] = {}
@@ -616,7 +632,11 @@ class PTCWrapper:
     def _programmatic_tool_call_descriptor(self) -> Dict[str, Any]:
         return {
             "name": self.PROGRAMMATIC_TOOL_CALL,
-            "description": _PROGRAMMATIC_TOOL_CALL_DESCRIPTION,
+            "description": (
+                _PROGRAMMATIC_TOOL_CALL_DESCRIPTION_ONLY
+                if self._ptc_only
+                else _PROGRAMMATIC_TOOL_CALL_DESCRIPTION
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -654,6 +674,13 @@ class PTCWrapper:
             }
         if self._tool_param_order and name not in self._tool_param_order:
             return _ptc_text_result(self._unknown_tool_message(name))
+        if self._ptc_only:
+            # Error message mirrors verl task-sync's --only-ptc dispatch.
+            return _ptc_text_result(
+                f"Env tool '{name}' cannot be invoked directly. "
+                f"Use {self.PROGRAMMATIC_TOOL_CALL} and call it as "
+                f'tools["{name}"](**kwargs).'
+            )
         raw = await self._inner.call_tool(name, arguments)
         return _jsonify(_stringify_result(raw))
 

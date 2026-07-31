@@ -51,6 +51,7 @@ class BaseMCPAgent(ABC):
         compaction_token: int = COMPACTION_DISABLED_TOKEN,
         ptc: bool = False,
         ptc_timeout: int = 60,
+        ptc_only: bool = False,
     ):
         self.litellm_input_model_name = litellm_input_model_name
         self.api_key = api_key
@@ -61,7 +62,8 @@ class BaseMCPAgent(ABC):
         self._service_config_provider = service_config_provider
         self.reasoning_effort = reasoning_effort or "default"
         self.compaction_token = int(compaction_token)
-        self.ptc = bool(ptc)
+        self.ptc_only = bool(ptc_only)
+        self.ptc = bool(ptc) or self.ptc_only  # ptc-only implies ptc
         self.ptc_timeout = int(ptc_timeout)
 
         self.is_claude = self._is_anthropic_model(litellm_input_model_name)
@@ -187,6 +189,7 @@ class BaseMCPAgent(ABC):
             workspace=workspace,
             default_code_timeout=self.ptc_timeout,
             service=self.mcp_service,
+            ptc_only=self.ptc_only,
         )
 
     def _create_stdio_server(self) -> MCPStdioServer:

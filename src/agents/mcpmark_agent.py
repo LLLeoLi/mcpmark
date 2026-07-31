@@ -128,6 +128,7 @@ class MCPMarkAgent(BaseMCPAgent):
         compaction_token: int = BaseMCPAgent.COMPACTION_DISABLED_TOKEN,
         ptc: bool = False,
         ptc_timeout: int = 60,
+        ptc_only: bool = False,
     ):
         super().__init__(
             litellm_input_model_name=litellm_input_model_name,
@@ -141,6 +142,7 @@ class MCPMarkAgent(BaseMCPAgent):
             compaction_token=compaction_token,
             ptc=ptc,
             ptc_timeout=ptc_timeout,
+            ptc_only=ptc_only,
         )
         logger.debug(
             "Initialized MCPMarkAgent for '%s' with model '%s' (Claude: %s, Thinking: %s, Reasoning: %s)",

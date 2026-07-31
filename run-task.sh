@@ -54,6 +54,10 @@ pass-through pipeline flags include:
                          in a persistent sandbox and routes tools[...]
                          calls back through the underlying MCP server.
                          Results land under <svc>-ptc/.
+    --ptc-only           PTC-only mode (implies --ptc): native tools stay
+                         listed but can only be invoked via tools[...]
+                         inside programmatic_tool_call. Results land under
+                         <svc>-ptc-only/.
     --ptc-timeout SECS   Per-call timeout for programmatic_tool_call
                          (default: 60).
 

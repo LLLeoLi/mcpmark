@@ -14,6 +14,7 @@ PARALLEL=false
 TIMEOUT=3600
 K=4
 PTC=false
+PTC_ONLY=false
 PTC_TIMEOUT=""
 
 # Color codes for output
@@ -75,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             PTC=true
             shift
             ;;
+        --ptc-only)
+            PTC_ONLY=true
+            shift
+            ;;
         --ptc-timeout)
             PTC_TIMEOUT="$2"
             shift 2
@@ -99,6 +104,9 @@ Optional Options:
     --k RUNS            Repeat runs per service for pass@k (default: 4)
     --ptc               Enable Programmatic Tool Calling (overlay a
                         programmatic_tool_call sandbox tool). Results land under <svc>-ptc/.
+    --ptc-only          PTC-only mode (implies --ptc): native tools stay listed but can
+                        only be invoked via tools[...] inside programmatic_tool_call.
+                        Results land under <svc>-ptc-only/.
     --ptc-timeout SECS  Default per-call timeout for programmatic_tool_call (default: 60)
 
 Examples:
@@ -219,9 +227,12 @@ run_service() {
     local ptc_args=()
     if [ "$PTC" = true ]; then
         ptc_args+=(--ptc)
-        if [ -n "$PTC_TIMEOUT" ]; then
-            ptc_args+=(--ptc-timeout "$PTC_TIMEOUT")
-        fi
+    fi
+    if [ "$PTC_ONLY" = true ]; then
+        ptc_args+=(--ptc-only)
+    fi
+    if [ ${#ptc_args[@]} -gt 0 ] && [ -n "$PTC_TIMEOUT" ]; then
+        ptc_args+=(--ptc-timeout "$PTC_TIMEOUT")
     fi
 
     if [ "$USE_DOCKER" = true ]; then

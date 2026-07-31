@@ -31,13 +31,15 @@ class MCPEvaluator:
         compaction_token: int = 0,
         ptc: bool = False,
         ptc_timeout: int = 60,
+        ptc_only: bool = False,
     ):
         # Main configuration
         self.mcp_service = mcp_service
         self.timeout = timeout
         self.agent_name = (agent_name or "mcpmark").lower()
         self.task_suite = (task_suite or "standard").lower()
-        self.ptc = bool(ptc)
+        self.ptc_only = bool(ptc_only)
+        self.ptc = bool(ptc) or self.ptc_only  # ptc-only implies ptc
         self.ptc_timeout = int(ptc_timeout)
         if self.agent_name not in AGENT_REGISTRY:
             raise ValueError(f"Unsupported agent '{agent_name}'. Available: {sorted(AGENT_REGISTRY)}")
@@ -80,6 +82,7 @@ class MCPEvaluator:
             compaction_token=compaction_token,
             ptc=self.ptc,
             ptc_timeout=self.ptc_timeout,
+            ptc_only=self.ptc_only,
         )
 
         # Initialize results reporter
@@ -93,7 +96,7 @@ class MCPEvaluator:
 
         service_for_dir = "playwright" if mcp_service == "playwright_webarena" else mcp_service
         suite_suffix = "" if self.task_suite in ("standard", "", None) else f"-{self.task_suite}"
-        ptc_suffix = "-ptc" if self.ptc else ""
+        ptc_suffix = "-ptc-only" if self.ptc_only else ("-ptc" if self.ptc else "")
         service_dir_name = f"{service_for_dir}{suite_suffix}{ptc_suffix}"
         self.base_experiment_dir = output_dir / f"{model_slug}__{service_dir_name}" / exp_name
         self.base_experiment_dir.mkdir(parents=True, exist_ok=True)
