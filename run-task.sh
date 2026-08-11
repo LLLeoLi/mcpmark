@@ -146,6 +146,7 @@ if [ "$SERVICE" = "postgres" ]; then
         -e QWEN3_8B_BASE_URL=http://host.docker.internal:28025/v1 \
         -e QWEN3_8B_SFT_BASE_URL=http://host.docker.internal:28025/v1 \
         -e QWEN3_5_9B_BASE_URL=http://host.docker.internal:28026/v1 \
+        -e QWEN3_14B_BASE_URL=http://host.docker.internal:28025/v1 \
         -e NO_PROXY=host.docker.internal \
         -e no_proxy=host.docker.internal \
         -v "$(pwd)/results:/app/results" \

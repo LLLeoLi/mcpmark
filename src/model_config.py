@@ -188,6 +188,12 @@ class ModelConfig:
             "base_url_var": "QWEN3_8B_SFT_BASE_URL",
             "litellm_input_model_name": "hosted_vllm/Qwen3-8B",
         },
+        "qwen-3-14b": {
+            "provider": "vllm",
+            "api_key_var": "QWEN3_14B_API_KEY",
+            "base_url_var": "QWEN3_14B_BASE_URL",
+            "litellm_input_model_name": "hosted_vllm/Qwen3-14B",
+        },
         "qwen-3.5-9b": {
             "provider": "vllm",
             "api_key_var": "QWEN3_5_9B_API_KEY",

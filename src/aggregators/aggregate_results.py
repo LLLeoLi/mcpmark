@@ -23,6 +23,43 @@ from src.aggregators.pricing import compute_cost_usd
 # Supported difficulty splits in ./tasks/<service>/<task_set>/
 SUPPORTED_TASK_SETS = {"standard", "easy"}
 
+# Execution-mode suffixes appended to the results service dir by
+# src/evaluator.py (`{service}{suite_suffix}{ptc_suffix}`). These describe *how*
+# the model was run, not *what* it ran, so they are folded into the model name
+# rather than treated as a separate service.
+RUN_MODE_SUFFIXES = ("-ptc-only", "-ptc")
+
+# Result service dirs that reuse another service's task list.
+SERVICE_ALIASES = {
+    "playwright_webarena": "playwright",
+    "supabase": "postgres",
+    "insforge": "postgres",
+}
+
+
+def parse_service_dir(name: str) -> Tuple[str, Optional[str]]:
+    """Split a results service dir name into (canonical service, run mode).
+
+    ``qwen__playwright_webarena-ptc`` -> ``("playwright", "ptc")``
+    ``qwen__filesystem-easy``         -> ``("filesystem", None)``
+
+    Order matters: evaluator.py appends the task-set suffix *before* the PTC
+    suffix, so the PTC suffix has to come off first.
+    """
+    run_mode = None
+    for suffix in RUN_MODE_SUFFIXES:
+        if name.endswith(suffix):
+            run_mode = suffix[1:]
+            name = name[: -len(suffix)]
+            break
+
+    for suffix in SUPPORTED_TASK_SETS:
+        if name.endswith(f"-{suffix}"):
+            name = name[: -(len(suffix) + 1)]
+            break
+
+    return SERVICE_ALIASES.get(name, name), run_mode
+
 
 def discover_tasks(task_set: str = "standard") -> Dict[str, List[str]]:
     """Discover all tasks from ./tasks directory filtered by task set."""
@@ -84,31 +121,20 @@ def collect_results(exp_dir: Path, k: int) -> Dict[str, Dict[str, Any]]:
     results = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
     
     # Current layout: results/<exp>/<model>__<service>/run-N/<category>__<task>/
-    # Some pipelines include task-set suffix in service dir (e.g., "filesystem-easy").
-    # Normalize such names back to canonical service keys used by tasks/ (filesystem, github, notion, playwright, postgres).
-
-    def normalize_service_name(name: str) -> str:
-        # Strip known task-set suffixes like "-easy" or "-standard"
-        if name.endswith("-easy") or name.endswith("-standard"):
-            base = name.rsplit("-", 1)[0]
-        else:
-            base = name
-
-        # Map variant names to canonical service
-        if base == "playwright_webarena":
-            return "playwright"
-        return base
+    # The service dir can carry a task-set suffix ("-easy") and/or a PTC run-mode
+    # suffix ("-ptc", "-ptc-only"); both are stripped back to a canonical service
+    # key matching tasks/ (filesystem, github, notion, playwright, postgres).
+    # The run mode is folded into the model key instead, so a --ptc pass shows up
+    # as its own model row ("qwen-3-8b-ptc") over the same task list.
     for model_service_dir in exp_dir.iterdir():
         if not model_service_dir.is_dir() or "__" not in model_service_dir.name:
             continue
-        
-        model, service = model_service_dir.name.split("__", 1)
-        # Normalize service names
-        if service == "playwright_webarena":
-            service = "playwright"
-        elif service in ["supabase", "insforge"]:
-            service = "postgres"
-        
+
+        model, service_dir = model_service_dir.name.split("__", 1)
+        service, run_mode = parse_service_dir(service_dir)
+        if run_mode:
+            model = f"{model}-{run_mode}"
+
         for run_idx in range(1, k + 1):
             run_dir = model_service_dir / f"run-{run_idx}"
             if not run_dir.exists():
@@ -816,11 +842,21 @@ def print_validation_report(complete: Dict, incomplete: Dict, invalid: Dict, all
     print("COMPLETENESS SUMMARY TABLE")
     print("=" * 100)
     print()
-    print(f"{'Model':<30} {'Expected':<12} {'Actual':<12} {'Missing':<12} {'Status':<30}")
+    print(f"{'Model':<38} {'Expected':<12} {'Actual':<12} {'Missing':<12} {'Status':<30}")
     print("-" * 100)
     
     sorted_models = sorted(all_models.keys())
-    
+
+    # Only count services that are actually being aggregated, otherwise --mcps
+    # runs report an inflated "Actual" from unrelated services.
+    def count_tasks(model_data: Dict) -> int:
+        return sum(
+            len(run_data)
+            for service, service_data in model_data.items()
+            if service in all_tasks
+            for run_data in service_data.values()
+        )
+
     for model_name in sorted_models:
         model_info = all_models[model_name]
         
@@ -830,21 +866,12 @@ def print_validation_report(complete: Dict, incomplete: Dict, invalid: Dict, all
         expected_total = total_expected_tasks * expected_runs
         
         if model_info["status"] == "complete":
-            # Count actual tasks from complete model data
-            actual_total = 0
-            for service, service_data in model_info["data"].items():
-                for run_name, run_data in service_data.items():
-                    actual_total += len(run_data)
+            actual_total = count_tasks(model_info["data"])
             missing = 0
             status = "✅ Complete"
         else:
             # For incomplete/invalid models, count from raw results
-            actual_total = 0
-            if model_name in raw_results:
-                for service, service_data in raw_results[model_name].items():
-                    for run_name, run_data in service_data.items():
-                        actual_total += len(run_data)
-            
+            actual_total = count_tasks(raw_results.get(model_name, {}))
             missing = expected_total - actual_total
             
             if model_info["status"] == "incomplete":
@@ -870,7 +897,7 @@ def print_validation_report(complete: Dict, incomplete: Dict, invalid: Dict, all
                 status = "⚠️  Invalid (retryable errors)"
         
         # Format the row
-        print(f"{model_name:<30} {expected_total:<12} {actual_total:<12} {missing:<12} {status:<30}")
+        print(f"{model_name:<38} {expected_total:<12} {actual_total:<12} {missing:<12} {status:<30}")
     
     print()
     
@@ -887,7 +914,7 @@ def print_validation_report(complete: Dict, incomplete: Dict, invalid: Dict, all
     print(f"Complete models: {complete_count}")
     print(f"Incomplete models: {incomplete_count}")
     print(f"Invalid models (with retryable errors): {invalid_count}")
-    print(f"Total tasks per MCP: {total_expected_tasks}")
+    print(f"Total tasks ({', '.join(sorted(all_tasks))}): {total_expected_tasks}")
     print(f"Expected runs (k): {k}")
     
     if not complete:
@@ -921,6 +948,17 @@ def main():
         default="standard",
         help="Which task subset to aggregate (default: standard)"
     )
+    parser.add_argument(
+        "--mcps",
+        type=str,
+        help=(
+            "Comma-separated services to aggregate, e.g. 'playwright'. Only these "
+            "count toward completeness, so a single-service experiment can be "
+            "aggregated without the other services being present. Aliases such as "
+            "playwright_webarena/supabase/insforge resolve to their canonical "
+            "service. Default: all services."
+        )
+    )
     parser.add_argument("--push", action="store_true", help="Push to GitHub (default to main)")
 
     args = parser.parse_args()
@@ -942,9 +980,22 @@ def main():
     # Discover all tasks
     print(f"📋 Discovering tasks (task set: {args.task_set})...")
     all_tasks = discover_tasks(args.task_set)
+
+    if args.mcps:
+        # parse_service_dir also resolves aliases, so --mcps playwright_webarena
+        # and --mcps playwright both select the merged 25-task playwright set.
+        wanted = {parse_service_dir(s.strip())[0] for s in args.mcps.split(",") if s.strip()}
+        unknown = wanted - set(all_tasks)
+        if unknown:
+            print(f"❌ Unknown service(s) for --mcps: {', '.join(sorted(unknown))}")
+            print(f"   Available: {', '.join(sorted(all_tasks))}")
+            return 1
+        all_tasks = {svc: tasks for svc, tasks in all_tasks.items() if svc in wanted}
+        print(f"  Restricted to service(s): {', '.join(sorted(wanted))}")
+
     total_tasks = sum(len(tasks) for tasks in all_tasks.values())
     print(f"  Found {total_tasks} tasks across {len(all_tasks)} services")
-    
+
     print("📥 Collecting results...")
     results = collect_results(exp_dir, args.k)
     print(f"  Found results for {len(results)} models")
