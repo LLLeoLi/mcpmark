@@ -47,6 +47,14 @@ python -m src.mcp_services.notion.notion_login_helper --browser {firefox|chromiu
 
 The verification script will tell you which browser is working properly. The pipeline defaults to using **chromium**. Our pipeline has been **fully tested on macOS and Linux**.
 
+The helper only writes `notion_state.json` after confirming the session is really authenticated — the `token_v2` cookie must be present, and `api/v3/getSpaces` must return 200 (tried on `app.notion.com`, falling back to `www.notion.so`; if neither is reachable it warns instead of failing, since a dead network is not a dead session). It exits non-zero otherwise, so a half-finished login can no longer leave you with an anonymous state file. To re-check an existing file at any time without logging in again:
+
+```bash
+python -m src.mcp_services.notion.notion_login_helper --check --browser chromium
+```
+
+Note the login flow needs a real browser window. On a headless server, `--headless` only supports the email + verification-code path; accounts that sign in with Google/Apple/SSO must run the helper on a machine with a display and copy `notion_state.json` over.
+
 ## 3. Running Notion Tasks
 
 1. Configure environment variables: make sure the following service credentials are added in `.mcp_env`.

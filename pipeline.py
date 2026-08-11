@@ -224,7 +224,12 @@ def main():
                 ptc_only=args.ptc_only,
             )
 
-            pipeline.run_evaluation(args.tasks)
+            try:
+                pipeline.run_evaluation(args.tasks)
+            finally:
+                # Release run-scoped resources before the next model / k-run
+                # builds its own evaluator in this same process.
+                pipeline.close()
             logger.info(f"📁 Results: {pipeline.base_experiment_dir}")
 
     logger.info(f"\n{'=' * 60}")

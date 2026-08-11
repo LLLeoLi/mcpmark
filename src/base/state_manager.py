@@ -101,6 +101,16 @@ class BaseStateManager(ABC):
             logger.error(f"Cleanup failed for {self.service_name}: {e}")
             return False
 
+    def close(self) -> None:
+        """Release long-lived resources held for the whole evaluation run.
+
+        Default is a no-op. Services that keep a session-scoped handle alive
+        across tasks (e.g. Notion's sync Playwright browser) must override this
+        and release it, otherwise a second state manager created later in the
+        same process cannot start its own instance.
+        """
+        return None
+
     def track_resource(
         self,
         resource_type: str,

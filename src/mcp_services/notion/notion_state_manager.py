@@ -33,7 +33,20 @@ logger = get_logger(__name__)
 ORPHAN_PAGE_PATTERN = re.compile(r".+\s+\(\d+\)$")
 
 # Selectors for Notion UI elements
-PAGE_MENU_BUTTON_SELECTOR = '[data-testid="more-button"], div.notion-topbar-more-button, [aria-label="More"], button[aria-label="More"]'
+#
+# The topbar "···" button: Notion renamed it to aria-label="Actions" and dropped
+# both data-testid="more-button" and aria-label="More" (see eval-sys/mcpmark#248).
+# The legacy selectors are kept as fallbacks for older Notion frontends.
+#
+# Do NOT add [aria-label="Delete, duplicate, and more…"] here: that is the
+# per-row menu in the left sidebar (19 of them on a normal page), and a
+# comma-joined CSS selector resolves to the first match in DOM order — which
+# would open the menu of some unrelated sidebar page instead of the open one.
+PAGE_MENU_BUTTON_SELECTOR = '[aria-label="Actions"], [data-testid="more-button"], div.notion-topbar-more-button, [aria-label="More"], button[aria-label="More"]'
+
+# The topbar hydrates lazily; the Actions button was still absent 20 s after
+# domcontentloaded on a heavy page, so allow well past that before giving up.
+PAGE_MENU_BUTTON_TIMEOUT_MS = 90_000
 DUPLICATE_MENU_ITEM_SELECTOR = 'text="Duplicate"'
 DUPLICATE_WITH_CONTENT_SELECTOR = 'text="Duplicate with content"'
 MOVE_TO_MENU_ITEM_SELECTOR = 'text="Move to"'
@@ -651,7 +664,7 @@ class NotionStateManager(BaseStateManager):
         try:
             # Step 1: Open the page menu
             page.wait_for_selector(
-                PAGE_MENU_BUTTON_SELECTOR, state="visible", timeout=30_000
+                PAGE_MENU_BUTTON_SELECTOR, state="visible", timeout=PAGE_MENU_BUTTON_TIMEOUT_MS
             )
             page.click(PAGE_MENU_BUTTON_SELECTOR)
 
@@ -674,7 +687,7 @@ class NotionStateManager(BaseStateManager):
             # Step 4: Wait for the search result matching the page title, then click it
             # Selector for the menu item row – ensure we click the outer container, not a nested <div>
             result_selector = (
-                f'div[role="menuitem"]:has-text("{self.eval_parent_page_title}")'
+                f'[role="menuitem"]:has-text("{self.eval_parent_page_title}")'
             )
             page.wait_for_selector(
                 result_selector, state="visible", timeout=wait_timeout
@@ -811,7 +824,7 @@ class NotionStateManager(BaseStateManager):
         try:
             logger.info("| ○ Opening page menu...")
             page.wait_for_selector(
-                PAGE_MENU_BUTTON_SELECTOR, state="visible", timeout=30_000
+                PAGE_MENU_BUTTON_SELECTOR, state="visible", timeout=PAGE_MENU_BUTTON_TIMEOUT_MS
             )
             page.click(PAGE_MENU_BUTTON_SELECTOR)
 

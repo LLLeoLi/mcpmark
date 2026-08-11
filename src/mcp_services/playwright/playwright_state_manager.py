@@ -301,6 +301,10 @@ class PlaywrightStateManager(BaseStateManager):
 
         return config
 
+    def close(self) -> None:
+        """Release the session-scoped browser at the end of an evaluation run."""
+        self.close_all()
+
     def close_all(self) -> None:
         """Close all browser resources."""
         try:

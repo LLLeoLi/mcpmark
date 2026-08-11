@@ -303,6 +303,18 @@ class MCPEvaluator:
 
         return result
 
+    def close(self) -> None:
+        """Release resources held for the whole run (e.g. the Notion browser).
+
+        Must be called before another evaluator is built in the same process:
+        `sync_playwright().start()` raises "Sync API inside the asyncio loop"
+        while an earlier instance is still alive in the same thread.
+        """
+        try:
+            self.state_manager.close()
+        except Exception as exc:
+            logger.warning("Failed to release state manager resources: %s", exc)
+
     def run_evaluation(self, task_filter: str) -> EvaluationReport:
         """
         Runs the full evaluation for the specified tasks.
